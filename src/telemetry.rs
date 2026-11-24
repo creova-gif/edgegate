@@ -1,8 +1,27 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use tracing::info;
 
-/// Atomic request, decision, and config-reload counters for EdgeGate observability.
+/// Sanitized flight-recorder entry for failed (`5xx`/`502`/`503`/`504`) or shadow-mismatched requests.
+/// Strictly excludes request/response headers, bodies, and secret material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayRecord {
+    pub request_id: u64,
+    pub org_id: String,
+    pub workload_id: String,
+    pub method: String,
+    pub path: String,
+    pub route: String,
+    pub upstream: String,
+    pub status: u16,
+    pub shadow_status: Option<u16>,
+    pub reason: String,
+    pub latency_us: u64,
+}
+
+/// Atomic request, decision, shadow, reload, and flight-recorder telemetry (`Milestone 3`).
 #[derive(Debug)]
 pub struct Telemetry {
     request_seq: AtomicU64,
@@ -12,6 +31,10 @@ pub struct Telemetry {
     reloads_total: AtomicU64,
     reload_failures_total: AtomicU64,
     config_generation: AtomicU64,
+    shadow_requests_total: AtomicU64,
+    shadow_mismatches_total: AtomicU64,
+    replay_capacity: usize,
+    replay_ring: Mutex<VecDeque<ReplayRecord>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,16 +45,23 @@ pub struct TelemetrySnapshot {
     pub reloads_total: u64,
     pub reload_failures_total: u64,
     pub config_generation: u64,
+    pub shadow_requests_total: u64,
+    pub shadow_mismatches_total: u64,
 }
 
 impl Default for Telemetry {
     fn default() -> Self {
-        Self::new()
+        Self::with_replay_capacity(64)
     }
 }
 
 impl Telemetry {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_replay_capacity(capacity: usize) -> Self {
+        let cap = capacity.max(1);
         Self {
             request_seq: AtomicU64::new(0),
             allowed_total: AtomicU64::new(0),
@@ -40,6 +70,10 @@ impl Telemetry {
             reloads_total: AtomicU64::new(0),
             reload_failures_total: AtomicU64::new(0),
             config_generation: AtomicU64::new(1),
+            shadow_requests_total: AtomicU64::new(0),
+            shadow_mismatches_total: AtomicU64::new(0),
+            replay_capacity: cap,
+            replay_ring: Mutex::new(VecDeque::with_capacity(cap)),
         }
     }
 
@@ -56,6 +90,58 @@ impl Telemetry {
         self.reload_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_shadow_outcome(&self, matched: bool) {
+        self.shadow_requests_total.fetch_add(1, Ordering::Relaxed);
+        if !matched {
+            self.shadow_mismatches_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_replay(&self, entry: ReplayRecord) {
+        let mut guard = match self.replay_ring.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.len() >= self.replay_capacity {
+            guard.pop_front();
+        }
+        guard.push_back(entry);
+    }
+
+    pub fn replay_records(&self) -> Vec<ReplayRecord> {
+        let guard = match self.replay_ring.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.iter().cloned().collect()
+    }
+
+    pub fn replay_to_json(&self) -> String {
+        let records = self.replay_records();
+        let mut items = Vec::with_capacity(records.len());
+        for r in records {
+            let shadow = match r.shadow_status {
+                Some(code) => code.to_string(),
+                None => "null".to_string(),
+            };
+            items.push(format!(
+                "{{\"request_id\":{},\"org_id\":\"{}\",\"workload_id\":\"{}\",\"method\":\"{}\",\"path\":\"{}\",\"route\":\"{}\",\"upstream\":\"{}\",\"status\":{},\"shadow_status\":{},\"reason\":\"{}\",\"latency_us\":{}}}",
+                r.request_id,
+                escape_json(&r.org_id),
+                escape_json(&r.workload_id),
+                escape_json(&r.method),
+                escape_json(&r.path),
+                escape_json(&r.route),
+                escape_json(&r.upstream),
+                r.status,
+                shadow,
+                escape_json(&r.reason),
+                r.latency_us
+            ));
+        }
+        format!("{{\"records\":[{}]}}", items.join(","))
+    }
+
     pub fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
             allowed_total: self.allowed_total.load(Ordering::Relaxed),
@@ -64,19 +150,23 @@ impl Telemetry {
             reloads_total: self.reloads_total.load(Ordering::Relaxed),
             reload_failures_total: self.reload_failures_total.load(Ordering::Relaxed),
             config_generation: self.config_generation.load(Ordering::Acquire),
+            shadow_requests_total: self.shadow_requests_total.load(Ordering::Relaxed),
+            shadow_mismatches_total: self.shadow_mismatches_total.load(Ordering::Relaxed),
         }
     }
 
     pub fn to_json(&self) -> String {
         let s = self.snapshot();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.upstream_errors_total,
             s.reloads_total,
             s.reload_failures_total,
-            s.config_generation
+            s.config_generation,
+            s.shadow_requests_total,
+            s.shadow_mismatches_total
         )
     }
 
@@ -113,7 +203,7 @@ impl Telemetry {
             target: "edgegate::audit",
             request_id = request_id,
             org_id = org_id,
-            workload_id = org_id_or_workload(workload_id),
+            workload_id = workload_id,
             route = route,
             upstream = upstream,
             decision = decision,
@@ -124,8 +214,8 @@ impl Telemetry {
     }
 }
 
-fn org_id_or_workload(val: &str) -> &str {
-    val
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub fn init_json_logging() {

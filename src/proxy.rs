@@ -1,25 +1,25 @@
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE, HOST};
-use http::{Request, Response, StatusCode, Uri};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{error, info, warn};
 
 use crate::auth::{
     HeaderTokenAuthenticator, TransportBoundAuthenticator, WorkloadAuthenticator, WorkloadIdentity,
 };
-use crate::config::CompiledConfig;
+use crate::config::{CompiledConfig, CompiledWorkload};
 use crate::lb::{LoadBalancer, PoolLoadBalancer};
 use crate::policy::{DefaultDenyPolicyEngine, PolicyDecision, PolicyEngine};
 use crate::pool::ConnectionPool;
@@ -27,28 +27,30 @@ use crate::router::{
     rewrite_upstream_path_and_query, sanitize_outbound_headers, validate_request_path, Router,
 };
 use crate::secrets::{MockSecretProvider, SecretProvider};
-use crate::telemetry::Telemetry;
+use crate::telemetry::{ReplayRecord, Telemetry};
 use crate::EdgeGateError;
-
-// EdgeGate Milestone 1 + 2 linear L7 security & proxy pipeline:
-//
-//   HTTP/1.1 Request (hyper v1 over TCP or zero-token Unix domain socket)
-//     0. Built-in /_edgegate/healthz & /_edgegate/metrics probes
-//     1. validate_request_path()            ──► 400 (dot-segments, \, %00, //)
-//     2. resolve WorkloadIdentity           ──► 401 (UDS transport identity OR X-EdgeGate-Token)
-//     3. router.match_route(path, host)     ──► 403 (default-deny unmatched destination)
-//     4. policy.evaluate(id, route, m, p)   ──► 403 (default-deny org_id / roles / method / prefix)
-//     5. lb.select(&route.pool)             ──► 503 (all backends unhealthy or in failure cooldown)
-//     6. sanitize_outbound_headers() + inject SecretProvider scoped credential
-//     7. pool.send(lease, outbound_req)     ──► 503 pool full (NO LB ejection)
-//                                           ──► 502/504/5xx (record passive LB failure)
-//                                           ──► 3xx returned verbatim (NEVER auto-followed)
-//     8. telemetry.record_request()         ──► structured JSON audit log (zero secrets)
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
+/// Optional routing-key header for `ConsistentHash` load balancing (`Milestone 3`).
+pub const ROUTING_KEY_HEADER: &str = "x-edgegate-routing-key";
+
+/// RAII handle returned by `EdgeGateProxy::register_boxlet_sandbox`.
+/// Automatically stops the sandbox UDS listener and removes the socket file when dropped.
+pub struct BoxletSandboxGuard {
+    socket_path: PathBuf,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BoxletSandboxGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
 /// Immutable runtime snapshot stored behind `ArcSwap` for lock-free hot-path reads
-/// and atomic zero-downtime config reloads (`Milestone 2`).
+/// and atomic zero-downtime config reloads.
 pub struct RuntimeSnapshot {
     pub config: Arc<CompiledConfig>,
     pub auth: Arc<dyn WorkloadAuthenticator>,
@@ -83,7 +85,8 @@ impl RuntimeSnapshot {
     }
 }
 
-/// Core EdgeGate reverse proxy server.
+/// Core EdgeGate reverse proxy server supporting HTTP/1.1 & HTTP/2, outbound TLS,
+/// three-state circuit breakers, traffic shadowing, flight-recorder replay, and Boxlet UDS attachment.
 pub struct EdgeGateProxy {
     runtime: Arc<ArcSwap<RuntimeSnapshot>>,
     telemetry: Arc<Telemetry>,
@@ -91,10 +94,11 @@ pub struct EdgeGateProxy {
 
 impl EdgeGateProxy {
     pub fn new(config: Arc<CompiledConfig>) -> Self {
+        let replay_cap = config.replay_buffer_size;
         let snapshot = Arc::new(RuntimeSnapshot::from_config(config));
         Self {
             runtime: Arc::new(ArcSwap::new(snapshot)),
-            telemetry: Arc::new(Telemetry::new()),
+            telemetry: Arc::new(Telemetry::with_replay_capacity(replay_cap)),
         }
     }
 
@@ -103,7 +107,6 @@ impl EdgeGateProxy {
     }
 
     /// Atomically reloads configuration from disk without dropping in-flight requests.
-    /// Fails safe: if parsing or validation fails, the existing snapshot stays active.
     pub fn reload_from_file(&self, path: &Path) -> Result<u64, EdgeGateError> {
         match CompiledConfig::from_file(path) {
             Ok(compiled) => Ok(self.swap_compiled(compiled)),
@@ -167,6 +170,20 @@ impl EdgeGateProxy {
         })
     }
 
+    /// Dynamically attaches a zero-token Boxlet sandbox Unix domain socket at runtime (`Milestone 3`).
+    /// Returns a RAII `BoxletSandboxGuard` that tears down the listener and socket file on drop.
+    pub fn register_boxlet_sandbox(
+        self: &Arc<Self>,
+        socket_path: PathBuf,
+        workload: CompiledWorkload,
+    ) -> Result<BoxletSandboxGuard, EdgeGateError> {
+        let handle = self.spawn_single_unix_listener(&socket_path, workload)?;
+        Ok(BoxletSandboxGuard {
+            socket_path,
+            handle,
+        })
+    }
+
     /// Binds and serves zero-token Unix domain socket listeners configured in `server.unix_listeners`.
     pub fn spawn_unix_listeners(
         self: &Arc<Self>,
@@ -175,54 +192,62 @@ impl EdgeGateProxy {
         let mut handles = Vec::with_capacity(snap.config.unix_listeners.len());
 
         for uds_cfg in &snap.config.unix_listeners {
-            if uds_cfg.path.exists() {
-                let _ = std::fs::remove_file(&uds_cfg.path);
-            }
-            let listener = UnixListener::bind(&uds_cfg.path).map_err(|e| {
-                EdgeGateError::Internal(format!(
-                    "failed to bind unix_listener '{}': {e}",
-                    uds_cfg.path.display()
-                ))
-            })?;
-            info!(
-                socket_path = %uds_cfg.path.display(),
-                workload_id = %uds_cfg.workload.workload_id,
-                org_id = %uds_cfg.workload.org_id,
-                "edgegate_unix_listener_bound"
-            );
-
-            let auth = Arc::new(TransportBoundAuthenticator::new(uds_cfg.workload.clone()));
-            let proxy = Arc::clone(self);
-            handles.push(tokio::spawn(async move {
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        break;
-                    };
-                    let io = TokioIo::new(stream);
-                    let proxy = Arc::clone(&proxy);
-                    let auth = Arc::clone(&auth);
-                    tokio::spawn(async move {
-                        let service = service_fn(move |req: Request<Incoming>| {
-                            let proxy = Arc::clone(&proxy);
-                            let auth = Arc::clone(&auth);
-                            async move {
-                                Ok::<_, std::convert::Infallible>(
-                                    proxy
-                                        .handle_request_with_auth(req, Some(auth.as_ref()))
-                                        .await,
-                                )
-                            }
-                        });
-                        let _ = http1::Builder::new()
-                            .keep_alive(true)
-                            .serve_connection(io, service)
-                            .await;
-                    });
-                }
-            }));
+            let h = self.spawn_single_unix_listener(&uds_cfg.path, uds_cfg.workload.clone())?;
+            handles.push(h);
         }
 
         Ok(handles)
+    }
+
+    fn spawn_single_unix_listener(
+        self: &Arc<Self>,
+        path: &Path,
+        workload: CompiledWorkload,
+    ) -> Result<tokio::task::JoinHandle<()>, EdgeGateError> {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let listener = UnixListener::bind(path).map_err(|e| {
+            EdgeGateError::Internal(format!(
+                "failed to bind unix_listener '{}': {e}",
+                path.display()
+            ))
+        })?;
+        info!(
+            socket_path = %path.display(),
+            workload_id = %workload.workload_id,
+            org_id = %workload.org_id,
+            "edgegate_unix_listener_bound"
+        );
+
+        let auth = Arc::new(TransportBoundAuthenticator::new(workload));
+        let proxy = Arc::clone(self);
+        Ok(tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let io = TokioIo::new(stream);
+                let proxy = Arc::clone(&proxy);
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let proxy = Arc::clone(&proxy);
+                        let auth = Arc::clone(&auth);
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                proxy
+                                    .handle_request_with_auth(req, Some(auth.as_ref()))
+                                    .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        }))
     }
 
     pub async fn serve(
@@ -257,8 +282,7 @@ impl EdgeGateProxy {
                             let proxy = Arc::clone(&proxy);
                             async move { Ok::<_, std::convert::Infallible>(proxy.handle_request(req).await) }
                         });
-                        if let Err(err) = http1::Builder::new()
-                            .keep_alive(true)
+                        if let Err(err) = AutoConnBuilder::new(TokioExecutor::new())
                             .serve_connection(io, service)
                             .await
                         {
@@ -294,7 +318,7 @@ impl EdgeGateProxy {
         let started = Instant::now();
         let path = req.uri().path();
 
-        // Step 0: Built-in observability endpoints.
+        // Step 0: Built-in observability & flight-recorder endpoints.
         if path == "/_edgegate/healthz" {
             let gen = self.telemetry.snapshot().config_generation;
             let body = Bytes::from(format!("{{\"status\":\"ok\",\"config_generation\":{gen}}}"));
@@ -312,9 +336,17 @@ impl EdgeGateProxy {
                 .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             return resp;
         }
+        if path == "/_edgegate/replay" {
+            let body = Bytes::from(self.telemetry.replay_to_json());
+            let mut resp = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            return resp;
+        }
 
         let req_id = self.telemetry.next_request_id();
-        let snap = self.runtime.load();
+        let snap = self.runtime.load_full();
 
         let method = req.method().clone();
         let path = path.to_string();
@@ -322,6 +354,11 @@ impl EdgeGateProxy {
         let host_header = req
             .headers()
             .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let routing_key = req
+            .headers()
+            .get(ROUTING_KEY_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
@@ -379,10 +416,24 @@ impl EdgeGateProxy {
             );
         }
 
-        // Step 5: Select healthy backend via LoadBalancer.
-        let lease = match snap.lb.select(&route.pool) {
+        // Step 5: Select healthy backend via LoadBalancer (supports ConsistentHash routing key).
+        let effective_key = routing_key.as_deref().unwrap_or(&identity.workload_id);
+        let mut lease = match snap.lb.select_with_key(&route.pool, Some(effective_key)) {
             Ok(l) => l,
             Err(err) => {
+                self.telemetry.record_replay(ReplayRecord {
+                    request_id: req_id,
+                    org_id: identity.org_id.clone(),
+                    workload_id: identity.workload_id.clone(),
+                    method: method.as_str().to_string(),
+                    path: path.clone(),
+                    route: route.id.clone(),
+                    upstream: "-".to_string(),
+                    status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    shadow_status: None,
+                    reason: "circuit_open_or_all_backends_unhealthy".to_string(),
+                    latency_us: started.elapsed().as_micros() as u64,
+                });
                 return self.finish_error(
                     req_id,
                     &identity.org_id,
@@ -496,9 +547,9 @@ impl EdgeGateProxy {
         };
 
         let mut outbound_req = match Request::builder()
-            .method(method)
-            .uri(upstream_uri)
-            .body(Full::new(collected))
+            .method(method.clone())
+            .uri(upstream_uri.clone())
+            .body(Full::new(collected.clone()))
         {
             Ok(r) => r,
             Err(err) => {
@@ -514,18 +565,51 @@ impl EdgeGateProxy {
                 );
             }
         };
-        *outbound_req.headers_mut() = outbound_headers;
+        *outbound_req.headers_mut() = outbound_headers.clone();
 
-        // Step 7: Forward through bounded single-flight pool (NO 3xx auto-follow, NO auto-retry).
+        // Step 7: Forward through bounded pool (NO 3xx auto-follow, NO auto-retry).
+        lease.settle_probe();
         match snap.pool.send(lease, outbound_req).await {
             Ok(resp) => {
                 let status = resp.status();
+                let latency_us = started.elapsed().as_micros() as u64;
                 if status.is_server_error() {
                     snap.lb.record_failure(&pool_name, &backend_id);
+                    self.telemetry.record_replay(ReplayRecord {
+                        request_id: req_id,
+                        org_id: identity.org_id.clone(),
+                        workload_id: identity.workload_id.clone(),
+                        method: method.as_str().to_string(),
+                        path: path.clone(),
+                        route: route.id.clone(),
+                        upstream: backend_id.clone(),
+                        status: status.as_u16(),
+                        shadow_status: None,
+                        reason: "upstream_5xx".to_string(),
+                        latency_us,
+                    });
                 } else {
-                    snap.lb.record_success(&pool_name, &backend_id);
+                    snap.lb.record_success(&pool_name, &backend_id, latency_us);
                 }
-                let latency_us = started.elapsed().as_micros() as u64;
+
+                // Step 7b: Non-blocking asynchronous traffic shadowing (`Milestone 3`).
+                if let Some(ref shadow_pool_name) = route.shadow_pool {
+                    self.spawn_shadow_dispatch(
+                        Arc::clone(&snap),
+                        req_id,
+                        identity.org_id.clone(),
+                        identity.workload_id.clone(),
+                        method.clone(),
+                        path.clone(),
+                        route.id.clone(),
+                        shadow_pool_name.clone(),
+                        upstream_uri,
+                        outbound_headers,
+                        collected,
+                        status.as_u16(),
+                    );
+                }
+
                 self.telemetry.record_request(
                     req_id,
                     &identity.org_id,
@@ -539,9 +623,23 @@ impl EdgeGateProxy {
                 resp.map(|b| b.boxed())
             }
             Err(err) => {
+                let latency_us = started.elapsed().as_micros() as u64;
                 match err {
                     EdgeGateError::BadGateway(_) | EdgeGateError::GatewayTimeout(_) => {
                         snap.lb.record_failure(&pool_name, &backend_id);
+                        self.telemetry.record_replay(ReplayRecord {
+                            request_id: req_id,
+                            org_id: identity.org_id.clone(),
+                            workload_id: identity.workload_id.clone(),
+                            method: method.as_str().to_string(),
+                            path: path.clone(),
+                            route: route.id.clone(),
+                            upstream: backend_id.clone(),
+                            status: err.status_code().as_u16(),
+                            shadow_status: None,
+                            reason: "upstream_transport_or_timeout".to_string(),
+                            latency_us,
+                        });
                     }
                     _ => {}
                 }
@@ -562,6 +660,85 @@ impl EdgeGateProxy {
                 )
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_shadow_dispatch(
+        &self,
+        snap: Arc<RuntimeSnapshot>,
+        req_id: u64,
+        org_id: String,
+        workload_id: String,
+        method: Method,
+        path: String,
+        route_id: String,
+        shadow_pool_name: String,
+        upstream_uri: Uri,
+        mut headers: HeaderMap,
+        body_bytes: Bytes,
+        primary_status: u16,
+    ) {
+        let telemetry = Arc::clone(&self.telemetry);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let Ok(mut shadow_lease) = snap.lb.select(&shadow_pool_name) else {
+                telemetry.record_shadow_outcome(false);
+                return;
+            };
+            let shadow_backend_id = shadow_lease.backend.id.clone();
+            if let Ok(host_val) = HeaderValue::from_str(&shadow_lease.backend.authority) {
+                headers.insert(HOST, host_val);
+            }
+            let Ok(mut shadow_req) = Request::builder()
+                .method(method.clone())
+                .uri(upstream_uri)
+                .body(Full::new(body_bytes))
+            else {
+                return;
+            };
+            *shadow_req.headers_mut() = headers;
+
+            shadow_lease.settle_probe();
+            match snap.pool.send(shadow_lease, shadow_req).await {
+                Ok(shadow_resp) => {
+                    let shadow_code = shadow_resp.status().as_u16();
+                    let _ = shadow_resp.into_body().collect().await;
+                    let matched = shadow_code == primary_status;
+                    telemetry.record_shadow_outcome(matched);
+                    if !matched {
+                        telemetry.record_replay(ReplayRecord {
+                            request_id: req_id,
+                            org_id,
+                            workload_id,
+                            method: method.as_str().to_string(),
+                            path,
+                            route: route_id,
+                            upstream: shadow_backend_id,
+                            status: primary_status,
+                            shadow_status: Some(shadow_code),
+                            reason: "shadow_status_mismatch".to_string(),
+                            latency_us: started.elapsed().as_micros() as u64,
+                        });
+                    }
+                }
+                Err(_) => {
+                    telemetry.record_shadow_outcome(false);
+                    telemetry.record_replay(ReplayRecord {
+                        request_id: req_id,
+                        org_id,
+                        workload_id,
+                        method: method.as_str().to_string(),
+                        path,
+                        route: route_id,
+                        upstream: shadow_backend_id,
+                        status: primary_status,
+                        shadow_status: Some(502),
+                        reason: "shadow_transport_error".to_string(),
+                        latency_us: started.elapsed().as_micros() as u64,
+                    });
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]

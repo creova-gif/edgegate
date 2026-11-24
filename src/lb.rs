@@ -1,36 +1,79 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{CompiledBackend, CompiledPool, LbStrategyConfig};
 use crate::EdgeGateError;
 
+/// Three-state circuit breaker status (`Milestone 3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal traffic admitted; trips to `Open` after `passive_failure_threshold` consecutive failures.
+    Closed { consecutive_failures: u32 },
+    /// Traffic rejected until `until`; transitions to `HalfOpen` once `now >= until`.
+    Open { until: Instant },
+    /// Admits at most ONE trial probe request (`probe_in_flight`).
+    /// Success transitions to `Closed`; failure immediately re-trips to `Open`.
+    HalfOpen { probe_in_flight: bool },
+}
+
 /// RAII lease returned by `LoadBalancer::select`.
-/// Decrements the backend's in-flight counter automatically on `Drop` so `LeastConnections`
-/// never leaks counts on early error or client disconnect.
+/// Decrements the backend's in-flight counter automatically on `Drop` and releases
+/// any unsettled `HalfOpen` probe flag if the request was aborted before recording a result.
 #[derive(Debug)]
 pub struct BackendLease {
     pub pool_name: String,
     pub backend: CompiledBackend,
     pub allow_private_ip: bool,
     in_flight: Arc<AtomicUsize>,
+    half_open_probe: Option<Arc<Mutex<CircuitState>>>,
+}
+
+impl BackendLease {
+    fn clear_probe_guard(&mut self) {
+        self.half_open_probe = None;
+    }
 }
 
 impl Drop for BackendLease {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if let Some(ref circuit) = self.half_open_probe {
+            let mut guard = match circuit.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if matches!(
+                *guard,
+                CircuitState::HalfOpen {
+                    probe_in_flight: true
+                }
+            ) {
+                *guard = CircuitState::HalfOpen {
+                    probe_in_flight: false,
+                };
+            }
+        }
     }
 }
 
-/// Trait seam for load balancing + passive/active backend health tracking.
+/// Trait seam for load balancing (`RoundRobin`, `LeastConnections`, `ConsistentHash`, `LatencyAware`)
+/// + three-state circuit breaker (`Closed`/`Open`/`HalfOpen`) + active health tracking.
 pub trait LoadBalancer: Send + Sync {
-    fn select(&self, pool_name: &str) -> Result<BackendLease, EdgeGateError>;
-    fn record_success(&self, pool_name: &str, backend_id: &str);
-    /// Record a passive backend failure (`502` connect/transport, `504` timeout, or upstream `5xx`).
+    fn select(&self, pool_name: &str) -> Result<BackendLease, EdgeGateError> {
+        self.select_with_key(pool_name, None)
+    }
+    fn select_with_key(
+        &self,
+        pool_name: &str,
+        routing_key: Option<&str>,
+    ) -> Result<BackendLease, EdgeGateError>;
+    fn record_success(&self, pool_name: &str, backend_id: &str, latency_us: u64);
+    /// Record a backend failure (`502` connect/transport, `504` timeout, or upstream `5xx`).
     /// NEVER call this on local `503` pool exhaustion.
     fn record_failure(&self, pool_name: &str, backend_id: &str);
-    /// Updates active health status from background HTTP health probes (`Milestone 2`).
+    /// Updates active health status from background HTTP health probes.
     fn set_active_health(&self, pool_name: &str, backend_id: &str, healthy: bool);
 }
 
@@ -39,51 +82,93 @@ struct BackendState {
     config: CompiledBackend,
     in_flight: Arc<AtomicUsize>,
     active_healthy: AtomicBool,
-    health: Mutex<PassiveHealth>,
-}
-
-#[derive(Debug)]
-struct PassiveHealth {
-    consecutive_failures: u32,
-    ejected_until: Option<Instant>,
+    ewma_latency_us: AtomicU64,
+    circuit: Arc<Mutex<CircuitState>>,
 }
 
 impl BackendState {
-    fn is_healthy(&self, now: Instant) -> bool {
+    /// Checks if the backend can accept a request now.
+    /// If transitioning into `HalfOpen` (or already `HalfOpen` with no probe in flight),
+    /// claims the single-flight trial probe slot and returns `Some(true)` (`is_half_open_probe = true`).
+    fn try_admit(&self, now: Instant) -> Option<bool> {
         if !self.active_healthy.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
-        let mut guard = match self.health.lock() {
+        let mut guard = match self.circuit.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(until) = guard.ejected_until {
-            if now < until {
-                return false;
+        match *guard {
+            CircuitState::Closed { .. } => Some(false),
+            CircuitState::Open { until } => {
+                if now >= until {
+                    *guard = CircuitState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    Some(true)
+                } else {
+                    None
+                }
             }
-            guard.ejected_until = None;
-            guard.consecutive_failures = 0;
+            CircuitState::HalfOpen { probe_in_flight } => {
+                if probe_in_flight {
+                    None
+                } else {
+                    *guard = CircuitState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    Some(true)
+                }
+            }
         }
-        true
     }
 
-    fn on_success(&self) {
-        let mut guard = match self.health.lock() {
+    fn on_success(&self, latency_us: u64) {
+        let mut guard = match self.circuit.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.consecutive_failures = 0;
-        guard.ejected_until = None;
+        *guard = CircuitState::Closed {
+            consecutive_failures: 0,
+        };
+        drop(guard);
+
+        // Update EWMA latency (alpha = 0.25 -> 3/4 old + 1/4 new).
+        let prev = self.ewma_latency_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            latency_us.max(1)
+        } else {
+            ((prev * 3) + latency_us.max(1)) / 4
+        };
+        self.ewma_latency_us.store(next, Ordering::Relaxed);
     }
 
     fn on_failure(&self, threshold: u32, cooldown: Duration, now: Instant) {
-        let mut guard = match self.health.lock() {
+        let mut guard = match self.circuit.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-        if guard.consecutive_failures >= threshold {
-            guard.ejected_until = Some(now + cooldown);
+        match *guard {
+            CircuitState::Closed {
+                consecutive_failures,
+            } => {
+                let next = consecutive_failures.saturating_add(1);
+                if next >= threshold {
+                    *guard = CircuitState::Open {
+                        until: now + cooldown,
+                    };
+                } else {
+                    *guard = CircuitState::Closed {
+                        consecutive_failures: next,
+                    };
+                }
+            }
+            CircuitState::HalfOpen { .. } | CircuitState::Open { .. } => {
+                // Failed HalfOpen trial probe immediately re-opens circuit for full cooldown.
+                *guard = CircuitState::Open {
+                    until: now + cooldown,
+                };
+            }
         }
     }
 }
@@ -99,8 +184,8 @@ struct PoolState {
     backends: Vec<BackendState>,
 }
 
-/// Pool-aware load balancer supporting both `RoundRobin` and `LeastConnections`
-/// plus passive error-based ejection and active probe health state.
+/// Pool-aware load balancer supporting `RoundRobin`, `LeastConnections`, `ConsistentHash`,
+/// and `LatencyAware` (EWMA), backed by a three-state `Closed`/`Open`/`HalfOpen` circuit breaker.
 #[derive(Debug)]
 pub struct PoolLoadBalancer {
     pools: HashMap<String, PoolState>,
@@ -117,10 +202,10 @@ impl PoolLoadBalancer {
                     config: b.clone(),
                     in_flight: Arc::new(AtomicUsize::new(0)),
                     active_healthy: AtomicBool::new(true),
-                    health: Mutex::new(PassiveHealth {
+                    ewma_latency_us: AtomicU64::new(0),
+                    circuit: Arc::new(Mutex::new(CircuitState::Closed {
                         consecutive_failures: 0,
-                        ejected_until: None,
-                    }),
+                    })),
                 })
                 .collect();
             pools.insert(
@@ -141,7 +226,11 @@ impl PoolLoadBalancer {
 }
 
 impl LoadBalancer for PoolLoadBalancer {
-    fn select(&self, pool_name: &str) -> Result<BackendLease, EdgeGateError> {
+    fn select_with_key(
+        &self,
+        pool_name: &str,
+        routing_key: Option<&str>,
+    ) -> Result<BackendLease, EdgeGateError> {
         let pool = self.pools.get(pool_name).ok_or_else(|| {
             EdgeGateError::ServiceUnavailable(format!("unknown upstream pool '{pool_name}'"))
         })?;
@@ -153,37 +242,66 @@ impl LoadBalancer for PoolLoadBalancer {
             )));
         }
 
-        let selected: Option<&BackendState> = match pool.strategy {
+        let selected: Option<(&BackendState, bool)> = match pool.strategy {
             LbStrategyConfig::RoundRobin => {
                 let start = pool.rr_cursor.fetch_add(1, Ordering::Relaxed);
-                (0..len)
-                    .map(|offset| &pool.backends[(start + offset) % len])
-                    .find(|b| b.is_healthy(now))
+                (0..len).find_map(|offset| {
+                    let b = &pool.backends[(start + offset) % len];
+                    b.try_admit(now).map(|is_probe| (b, is_probe))
+                })
+            }
+            LbStrategyConfig::ConsistentHash => {
+                let start = match routing_key {
+                    Some(key) if !key.is_empty() => (fnv1a_64(key.as_bytes()) as usize) % len,
+                    _ => pool.rr_cursor.fetch_add(1, Ordering::Relaxed) % len,
+                };
+                (0..len).find_map(|offset| {
+                    let b = &pool.backends[(start + offset) % len];
+                    b.try_admit(now).map(|is_probe| (b, is_probe))
+                })
             }
             LbStrategyConfig::LeastConnections => {
                 let start = pool.rr_cursor.fetch_add(1, Ordering::Relaxed);
-                let mut best: Option<(&BackendState, usize)> = None;
+                let mut best: Option<(&BackendState, bool, usize)> = None;
                 for offset in 0..len {
                     let candidate = &pool.backends[(start + offset) % len];
-                    if !candidate.is_healthy(now) {
+                    let active = candidate.in_flight.load(Ordering::Acquire);
+                    if best.is_some_and(|(_, _, best_active)| active >= best_active) {
                         continue;
                     }
-                    let active = candidate.in_flight.load(Ordering::Acquire);
-                    match best {
-                        None => best = Some((candidate, active)),
-                        Some((_, best_active)) if active < best_active => {
-                            best = Some((candidate, active));
+                    if let Some(is_probe) = candidate.try_admit(now) {
+                        // Release any previously claimed half-open probe if we found a better candidate.
+                        if let Some((prev, true, _)) = best {
+                            release_half_open_probe(&prev.circuit);
                         }
-                        _ => {}
+                        best = Some((candidate, is_probe, active));
                     }
                 }
-                best.map(|(b, _)| b)
+                best.map(|(b, is_probe, _)| (b, is_probe))
+            }
+            LbStrategyConfig::LatencyAware => {
+                let start = pool.rr_cursor.fetch_add(1, Ordering::Relaxed);
+                let mut best: Option<(&BackendState, bool, u64)> = None;
+                for offset in 0..len {
+                    let candidate = &pool.backends[(start + offset) % len];
+                    let ewma = candidate.ewma_latency_us.load(Ordering::Relaxed);
+                    if best.is_some_and(|(_, _, best_ewma)| ewma >= best_ewma) {
+                        continue;
+                    }
+                    if let Some(is_probe) = candidate.try_admit(now) {
+                        if let Some((prev, true, _)) = best {
+                            release_half_open_probe(&prev.circuit);
+                        }
+                        best = Some((candidate, is_probe, ewma));
+                    }
+                }
+                best.map(|(b, is_probe, _)| (b, is_probe))
             }
         };
 
-        let backend = selected.ok_or_else(|| {
+        let (backend, is_probe) = selected.ok_or_else(|| {
             EdgeGateError::ServiceUnavailable(format!(
-                "all backends in pool '{pool_name}' are unhealthy or in passive failure cooldown"
+                "all backends in pool '{pool_name}' have open circuit breakers or are unhealthy"
             ))
         })?;
 
@@ -193,13 +311,18 @@ impl LoadBalancer for PoolLoadBalancer {
             backend: backend.config.clone(),
             allow_private_ip: pool.allow_private_ip,
             in_flight: Arc::clone(&backend.in_flight),
+            half_open_probe: if is_probe {
+                Some(Arc::clone(&backend.circuit))
+            } else {
+                None
+            },
         })
     }
 
-    fn record_success(&self, pool_name: &str, backend_id: &str) {
+    fn record_success(&self, pool_name: &str, backend_id: &str, latency_us: u64) {
         if let Some(pool) = self.pools.get(pool_name) {
             if let Some(b) = pool.backends.iter().find(|b| b.config.id == backend_id) {
-                b.on_success();
+                b.on_success(latency_us);
             }
         }
     }
@@ -221,10 +344,43 @@ impl LoadBalancer for PoolLoadBalancer {
             if let Some(b) = pool.backends.iter().find(|b| b.config.id == backend_id) {
                 b.active_healthy.store(healthy, Ordering::Release);
                 if healthy {
-                    b.on_success();
+                    b.on_success(100);
                 }
             }
         }
+    }
+}
+
+fn release_half_open_probe(circuit: &Mutex<CircuitState>) {
+    let mut guard = match circuit.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if matches!(
+        *guard,
+        CircuitState::HalfOpen {
+            probe_in_flight: true
+        }
+    ) {
+        *guard = CircuitState::HalfOpen {
+            probe_in_flight: false,
+        };
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+impl BackendLease {
+    /// Marks the lease's circuit probe settled so `Drop` does not reset a completed transition.
+    pub fn settle_probe(&mut self) {
+        self.clear_probe_guard();
     }
 }
 
@@ -247,6 +403,7 @@ mod tests {
                         authority: "127.0.0.1:9001".to_string(),
                         tls: false,
                         tls_sni: "127.0.0.1".to_string(),
+                        http2: false,
                     },
                     CompiledBackend {
                         id: "b".to_string(),
@@ -255,6 +412,7 @@ mod tests {
                         authority: "127.0.0.1:9002".to_string(),
                         tls: false,
                         tls_sni: "127.0.0.1".to_string(),
+                        http2: false,
                     },
                 ],
                 max_connections_per_upstream: 8,
@@ -298,26 +456,54 @@ mod tests {
     }
 
     #[test]
-    fn passive_and_active_health_skip_unhealthy_backends() {
-        let lb = make_pool(LbStrategyConfig::RoundRobin, 2, 5_000);
-        lb.set_active_health("api", "a", false);
-        let lease = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
-        assert_eq!(lease.backend.id, "b");
-
-        lb.set_active_health("api", "a", true);
-        lb.record_failure("api", "a");
-        lb.record_failure("api", "a");
-
-        for _ in 0..4 {
-            let lease = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
-            assert_eq!(lease.backend.id, "b");
+    fn consistent_hash_pins_same_key_and_latency_aware_prefers_faster_backend() {
+        let ch = make_pool(LbStrategyConfig::ConsistentHash, 3, 5_000);
+        let first = ch
+            .select_with_key("api", Some("tenant-42"))
+            .unwrap_or_else(|e| panic!("err: {e}"))
+            .backend
+            .id
+            .clone();
+        for _ in 0..5 {
+            let next = ch
+                .select_with_key("api", Some("tenant-42"))
+                .unwrap_or_else(|e| panic!("err: {e}"))
+                .backend
+                .id
+                .clone();
+            assert_eq!(first, next);
         }
 
+        let lat = make_pool(LbStrategyConfig::LatencyAware, 3, 5_000);
+        lat.record_success("api", "a", 5_000); // 5ms
+        lat.record_success("api", "b", 200); // 0.2ms
+        let picked = lat.select("api").unwrap_or_else(|e| panic!("err: {e}"));
+        assert_eq!(picked.backend.id, "b");
+    }
+
+    #[test]
+    fn three_state_circuit_breaker_admits_single_half_open_probe_before_closing() {
+        let lb = make_pool(LbStrategyConfig::RoundRobin, 1, 20);
+        // Trip `a` and `b` into Open state (20ms cooldown).
+        lb.record_failure("api", "a");
         lb.record_failure("api", "b");
-        lb.record_failure("api", "b");
-        assert!(matches!(
-            lb.select("api"),
-            Err(EdgeGateError::ServiceUnavailable(_))
-        ));
+        assert!(lb.select("api").is_err());
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Now `a` and `b` are eligible for HalfOpen, but each admits at most 1 trial probe!
+        let mut probe_a = lb.select("api").unwrap_or_else(|e| panic!("probe a: {e}"));
+        let _probe_b = lb.select("api").unwrap_or_else(|e| panic!("probe b: {e}"));
+        // Third concurrent request while both HalfOpen probes are in-flight must be rejected!
+        assert!(lb.select("api").is_err());
+
+        // Settle `probe_a` as succeeded -> its backend transitions back to Closed!
+        let settled_id = probe_a.backend.id.clone();
+        probe_a.settle_probe();
+        lb.record_success("api", &settled_id, 100);
+        drop(probe_a);
+
+        let after = lb.select("api").unwrap_or_else(|e| panic!("after: {e}"));
+        assert_eq!(after.backend.id, settled_id);
     }
 }
