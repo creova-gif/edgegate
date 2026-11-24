@@ -6,21 +6,24 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::header::CONNECTION;
-use http::{Request, Response};
-use http_body_util::Full;
+use http::header::{CONNECTION, HOST};
+use http::{Method, Request, Response};
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper_util::rt::TokioIo;
 use pin_project_lite::pin_project;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_rustls::TlsConnector;
 
-use crate::config::CompiledPool;
+use crate::config::{CompiledBackend, CompiledPool};
 use crate::lb::BackendLease;
 use crate::EdgeGateError;
 
-// Single-flight HTTP/1.1 connection pool lifecycle:
+// Single-flight HTTP/1.1 connection pool lifecycle (with optional outbound rustls TLS):
 //
 //   acquire Semaphore permit (bounded; try_acquire -> 503 local backpressure, NO LB ejection)
 //        │
@@ -28,6 +31,7 @@ use crate::EdgeGateError;
 //   pop idle SendRequest (discard expired idle_ttl or sender.is_closed())
 //        ├── hit  ──► poll_ready()
 //        └── miss ──► lookup_host -> validate EVERY IPv4/IPv6/::ffff: IP -> TcpStream::connect(validated_addr)
+//                                  -> [if backend.tls: TlsConnector::connect(sni)]
 //                                  -> hyper http1::handshake -> spawn conn driver
 //        │
 //        ▼
@@ -46,19 +50,30 @@ struct IdleConn {
     returned_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 struct UpstreamSlot {
     semaphore: Arc<Semaphore>,
     idle: Arc<Mutex<VecDeque<IdleConn>>>,
     idle_ttl: Duration,
+    tls_connector: Option<TlsConnector>,
+}
+
+impl std::fmt::Debug for UpstreamSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamSlot")
+            .field("idle_ttl", &self.idle_ttl)
+            .field("tls_enabled", &self.tls_connector.is_some())
+            .finish()
+    }
 }
 
 impl UpstreamSlot {
-    fn new(max_conns: usize, idle_ttl: Duration) -> Self {
+    fn new(max_conns: usize, idle_ttl: Duration, tls_connector: Option<TlsConnector>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_conns)),
             idle: Arc::new(Mutex::new(VecDeque::new())),
             idle_ttl,
+            tls_connector,
         }
     }
 
@@ -113,12 +128,10 @@ impl PooledBody {
                     returned_at: Instant::now(),
                 });
             }
-            // `_permit` and `_lb_lease` drop here, releasing pool capacity and LB in-flight count.
         }
     }
 
     fn discard_dirty(&mut self) {
-        // Dropping `state` drops `sender` (closing the TCP socket) and releases permit + LB lease.
         self.state = None;
     }
 }
@@ -135,7 +148,6 @@ impl Body for PooledBody {
         match this.inner.poll_frame(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                // Full EOF reached cleanly.
                 if let Some(state) = this.state.take() {
                     if !state.connection_close
                         && !state.sender.is_closed()
@@ -170,7 +182,8 @@ impl Body for PooledBody {
     }
 }
 
-/// Bounded per-upstream HTTP/1.1 connection pool with resolve-validate-connect SSRF protection.
+/// Bounded per-upstream HTTP/1.1 connection pool with resolve-validate-connect SSRF protection
+/// and optional `rustls` outbound TLS.
 #[derive(Debug)]
 pub struct ConnectionPool {
     slots: HashMap<(String, String), UpstreamSlot>,
@@ -186,10 +199,16 @@ impl ConnectionPool {
     ) -> Self {
         let mut slots = HashMap::new();
         for (pool_name, pool) in compiled {
+            let pool_tls = build_tls_connector(&pool.custom_ca_certs);
             for backend in &pool.backends {
+                let tls_connector = if backend.tls { pool_tls.clone() } else { None };
                 slots.insert(
                     (pool_name.clone(), backend.id.clone()),
-                    UpstreamSlot::new(pool.max_connections_per_upstream, pool.idle_ttl),
+                    UpstreamSlot::new(
+                        pool.max_connections_per_upstream,
+                        pool.idle_ttl,
+                        tls_connector,
+                    ),
                 );
             }
         }
@@ -200,10 +219,6 @@ impl ConnectionPool {
         }
     }
 
-    /// Sends one HTTP/1.1 request to the leased backend.
-    /// - Returns `EdgeGateError::PoolExhausted` (`503`, must NOT trigger passive LB ejection) when bounded capacity is full.
-    /// - Returns `EdgeGateError::BadGateway` (`502`) on SSRF block or connect/transport error.
-    /// - Returns `EdgeGateError::GatewayTimeout` (`504`) on connect or response-header timeout.
     pub async fn send(
         &self,
         lease: BackendLease,
@@ -228,15 +243,14 @@ impl ConnectionPool {
             Some(idle_sender) => idle_sender,
             None => {
                 self.dial_validated(
-                    &lease.backend.host,
-                    lease.backend.port,
+                    &lease.backend,
                     lease.allow_private_ip,
+                    slot.tls_connector.as_ref(),
                 )
                 .await?
             }
         };
 
-        // Ensure single-flight SendRequest is ready before dispatching.
         if tokio::time::timeout(self.connect_timeout, sender.ready())
             .await
             .map_err(|_| {
@@ -244,13 +258,11 @@ impl ConnectionPool {
             })?
             .is_err()
         {
-            // Idle socket closed right before use: dial one fresh validated connection
-            // (no bytes were written to the wire yet).
             sender = self
                 .dial_validated(
-                    &lease.backend.host,
-                    lease.backend.port,
+                    &lease.backend,
                     lease.allow_private_ip,
+                    slot.tls_connector.as_ref(),
                 )
                 .await?;
             tokio::time::timeout(self.connect_timeout, sender.ready())
@@ -292,7 +304,6 @@ impl ConnectionPool {
             }),
         };
 
-        // If the response has an empty body already at EOF, return the connection immediately.
         if pooled_body.inner.is_end_stream() {
             if connection_close {
                 pooled_body.discard_dirty();
@@ -304,19 +315,88 @@ impl ConnectionPool {
         Ok(Response::from_parts(parts, pooled_body))
     }
 
+    /// Executes an active HTTP health probe (`GET <health_check_path>`) against a backend,
+    /// returning `true` if it responds with a `2xx` status code within `connect_timeout`.
+    pub async fn probe_backend_health(
+        &self,
+        pool_name: &str,
+        backend: &CompiledBackend,
+        allow_private_ip: bool,
+        path: &str,
+    ) -> bool {
+        let key = (pool_name.to_string(), backend.id.clone());
+        let tls_connector = self.slots.get(&key).and_then(|s| s.tls_connector.as_ref());
+        let Ok(mut sender) = self
+            .dial_validated(backend, allow_private_ip, tls_connector)
+            .await
+        else {
+            return false;
+        };
+
+        let Ok(req) = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(HOST, &backend.authority)
+            .header(CONNECTION, "close")
+            .body(Full::new(Bytes::new()))
+        else {
+            return false;
+        };
+
+        let Ok(Ok(resp)) =
+            tokio::time::timeout(self.connect_timeout, sender.send_request(req)).await
+        else {
+            return false;
+        };
+        let status_ok = resp.status().is_success();
+        let _ = tokio::time::timeout(self.connect_timeout, resp.into_body().collect()).await;
+        status_ok
+    }
+
     async fn dial_validated(
         &self,
-        host: &str,
-        port: u16,
+        backend: &CompiledBackend,
         allow_private_ip: bool,
+        tls_connector: Option<&TlsConnector>,
     ) -> Result<SendRequest<Full<Bytes>>, EdgeGateError> {
-        let validated_addr = resolve_and_validate_addr(host, port, allow_private_ip).await?;
+        let validated_addr =
+            resolve_and_validate_addr(&backend.host, backend.port, allow_private_ip).await?;
         let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(validated_addr))
             .await
             .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
             .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
 
         let _ = stream.set_nodelay(true);
+
+        if backend.tls {
+            let connector = tls_connector.ok_or_else(|| {
+                EdgeGateError::BadGateway(
+                    "TLS enabled on backend but TLS connector unavailable".to_string(),
+                )
+            })?;
+            let server_name = ServerName::try_from(backend.tls_sni.clone()).map_err(|e| {
+                EdgeGateError::BadGateway(format!("invalid TLS SNI '{}': {e}", backend.tls_sni))
+            })?;
+            let tls_stream =
+                tokio::time::timeout(self.connect_timeout, connector.connect(server_name, stream))
+                    .await
+                    .map_err(|_| {
+                        EdgeGateError::GatewayTimeout("upstream TLS handshake timeout".to_string())
+                    })?
+                    .map_err(|e| {
+                        EdgeGateError::BadGateway(format!("upstream TLS handshake failed: {e}"))
+                    })?;
+
+            let io = TokioIo::new(tls_stream);
+            let (sender, conn) = http1::handshake(io).await.map_err(|e| {
+                EdgeGateError::BadGateway(format!("HTTPS HTTP/1.1 handshake failed: {e}"))
+            })?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            return Ok(sender);
+        }
+
         let io = TokioIo::new(stream);
         let (sender, conn) = http1::handshake(io)
             .await
@@ -328,6 +408,23 @@ impl ConnectionPool {
 
         Ok(sender)
     }
+}
+
+fn build_tls_connector(custom_ca_certs: &[CertificateDer<'static>]) -> Option<TlsConnector> {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in custom_ca_certs {
+        if root_store.add(cert.clone()).is_err() {
+            return None;
+        }
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Some(TlsConnector::from(Arc::new(config)))
 }
 
 /// Resolve-validate-connect SSRF guard:
@@ -373,8 +470,6 @@ pub async fn resolve_and_validate_addr(
     Ok(addrs[0])
 }
 
-/// Returns `true` if `ip` belongs to loopback, private RFC1918, link-local/cloud metadata,
-/// CGNAT, unspecified, broadcast, IPv6 ULA/link-local, or IPv4-mapped IPv6 targeting any of those.
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -390,8 +485,8 @@ fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || v4.is_broadcast()
         || v4.is_multicast()
-        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT
-        || (o[0] == 169 && o[1] == 254) // 169.254.0.0/16 cloud metadata / link-local
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+        || (o[0] == 169 && o[1] == 254)
 }
 
 fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
@@ -402,8 +497,8 @@ fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
     v6.is_loopback()
         || v6.is_unspecified()
         || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local
-        || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local
+        || (segs[0] & 0xfe00) == 0xfc00
+        || (segs[0] & 0xffc0) == 0xfe80
 }
 
 #[cfg(test)]

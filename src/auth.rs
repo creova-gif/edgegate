@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use http::HeaderMap;
 use subtle::ConstantTimeEq;
@@ -6,17 +6,18 @@ use subtle::ConstantTimeEq;
 use crate::config::{sha256_digest, CompiledWorkload};
 use crate::EdgeGateError;
 
-/// Locked Milestone 1 workload authentication header (unconditionally stripped before upstream forwarding).
+/// Locked workload authentication header (unconditionally stripped before upstream forwarding).
 pub const WORKLOAD_TOKEN_HEADER: &str = "x-edgegate-token";
 
-/// Verified workload identity for Milestone 1 (`roles` deferred to M2 RBAC).
+/// Verified workload identity with RBAC roles (`Milestone 2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadIdentity {
     pub workload_id: String,
     pub org_id: String,
+    pub roles: HashSet<String>,
 }
 
-/// Trait seam for workload authentication (M1 header token; M2 Boxlet UDS/socket peer identity).
+/// Trait seam for workload authentication (header token or transport-bound UDS socket).
 pub trait WorkloadAuthenticator: Send + Sync {
     fn authenticate(&self, headers: &HeaderMap) -> Result<WorkloadIdentity, EdgeGateError>;
 }
@@ -56,6 +57,7 @@ impl WorkloadAuthenticator for HeaderTokenAuthenticator {
                 return Ok(WorkloadIdentity {
                     workload_id: workload.workload_id.clone(),
                     org_id: workload.org_id.clone(),
+                    roles: workload.roles.clone(),
                 });
             }
         }
@@ -63,6 +65,30 @@ impl WorkloadAuthenticator for HeaderTokenAuthenticator {
         Err(EdgeGateError::Unauthorized(
             "invalid workload token".to_string(),
         ))
+    }
+}
+
+/// Zero-token transport-bound authenticator used by dedicated per-sandbox Unix domain socket listeners.
+#[derive(Debug, Clone)]
+pub struct TransportBoundAuthenticator {
+    identity: WorkloadIdentity,
+}
+
+impl TransportBoundAuthenticator {
+    pub fn new(workload: CompiledWorkload) -> Self {
+        Self {
+            identity: WorkloadIdentity {
+                workload_id: workload.workload_id,
+                org_id: workload.org_id,
+                roles: workload.roles,
+            },
+        }
+    }
+}
+
+impl WorkloadAuthenticator for TransportBoundAuthenticator {
+    fn authenticate(&self, _headers: &HeaderMap) -> Result<WorkloadIdentity, EdgeGateError> {
+        Ok(self.identity.clone())
     }
 }
 
@@ -79,13 +105,14 @@ mod tests {
             CompiledWorkload {
                 workload_id: "agent-1".to_string(),
                 org_id: "org-alpha".to_string(),
+                roles: ["repo:read".to_string()].into_iter().collect(),
             },
         );
         HeaderTokenAuthenticator::new(map)
     }
 
     #[test]
-    fn authenticates_valid_token() {
+    fn authenticates_valid_token_with_roles() {
         let auth = test_auth();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -98,6 +125,21 @@ mod tests {
             .unwrap_or_else(|e| panic!("expected ok: {e}"));
         assert_eq!(id.workload_id, "agent-1");
         assert_eq!(id.org_id, "org-alpha");
+        assert!(id.roles.contains("repo:read"));
+    }
+
+    #[test]
+    fn transport_bound_authenticator_requires_zero_headers() {
+        let auth = TransportBoundAuthenticator::new(CompiledWorkload {
+            workload_id: "boxlet-sandbox-1".to_string(),
+            org_id: "org-alpha".to_string(),
+            roles: ["inference:call".to_string()].into_iter().collect(),
+        });
+        let id = auth
+            .authenticate(&HeaderMap::new())
+            .unwrap_or_else(|e| panic!("expected ok: {e}"));
+        assert_eq!(id.workload_id, "boxlet-sandbox-1");
+        assert!(id.roles.contains("inference:call"));
     }
 
     #[test]

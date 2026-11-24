@@ -4,17 +4,15 @@ High-performance, programmable L7 reverse proxy and load balancer written in Rus
 
 > **Defining principle:** Untrusted workloads should be able to access explicitly authorized services without possessing the underlying upstream credentials or unrestricted outbound network authority.
 
-## What Milestone 1 Proves
+## Capabilities (Milestone 1 & Milestone 2)
 
-- **Explicit L7 HTTP/1.1 Reverse Proxy (`tokio` + `hyper` v1):** Hand-built routing, load balancing, bounded single-flight connection pooling, authentication, policy enforcement, and credential injection on top of `hyper` v1 HTTP/1.1 framing.
-- **Zero-Secret Credential Injection:** Workloads hold zero upstream API keys. EdgeGate verifies the workload's scoped `X-EdgeGate-Token` (constant-time SHA-256 via `subtle`), enforces default-deny `(org_id, workload_id, route_id, method, path_prefix)` policies, strips client auth and RFC 9110 hop-by-hop headers, and injects scoped upstream credentials (`SecretProvider`) on the wire.
-- **Load Balancing & Passive Health:** Both `RoundRobin` and `LeastConnections` (RAII `AtomicUsize` in-flight guard) behind `LoadBalancer`, with passive failure ejection cooldown on `502`/`504`/upstream `5xx` (never on local `503` pool exhaustion).
-- **Structural Security Boundaries:**
-  - Fail-closed pre-policy path validation (`400` on raw/encoded dot-segments, backslashes, null bytes, double slashes).
-  - Never auto-follows `3xx` redirects (prevents cross-domain credential leakage and redirect SSRF).
-  - Resolve-validate-connect SSRF guard blocking IPv4 loopback/RFC1918/metadata (`169.254.169.254`), IPv6 ULA/link-local, and IPv4-mapped IPv6 (`::ffff:169.254.169.254`) unless explicitly opted in for local test pools.
-  - Single-flight HTTP/1.1 `SendRequest` checkout with `PooledBody` EOF-drain/`Drop` guard to prevent cross-tenant stream desynchronization.
-- **Container Zero-Bypass Demo:** Docker Compose proof where an isolated sandbox runs on an `internal: true` network with zero upstream API keys and zero direct egress.
+- **Explicit L7 HTTP/1.1 & Outbound HTTPS Reverse Proxy (`tokio` + `hyper` v1 + `rustls`):** Hand-built routing, load balancing, bounded single-flight connection pooling, authentication, policy enforcement, and credential injection over plaintext HTTP/1.1 and encrypted `rustls` HTTPS (`webpki-roots` + custom CA PEM verification).
+- **Zero-Secret Credential Injection & Environment Secret Resolution:** Workloads hold zero upstream API keys. EdgeGate resolves scoped secrets from inline config or host environment variables (`env = "VAR_NAME"`) and injects them on the wire after policy authorization.
+- **Zero-Token Transport-Identity Unix Domain Sockets (`server.unix_listeners`):** Sandboxes or Boxlet containers mounted to a dedicated per-workload UDS socket authenticate via the transport boundary itself with **zero tokens in environment variables or memory**.
+- **Default-Deny Multi-Tenant & RBAC Policy Engine:** Enforces `(org_id, workload_id, required_roles, route_id, method, path_prefix)` with constant-time SHA-256 token verification (`subtle`).
+- **Atomic Zero-Downtime Configuration Hot Reload (`ArcSwap`):** Validates and swaps `RuntimeSnapshot` atomically (`--watch-interval-ms` or programmatic reload) without dropping in-flight requests; invalid reload configs fail safe.
+- **Load Balancing, Passive Ejection & Active HTTP Health Probes:** `RoundRobin` and `LeastConnections` (RAII `AtomicUsize` in-flight guard) with passive failure ejection cooldown (excluding local `503` pool exhaustion) and background active HTTP health probes (`health_check_path`).
+- **Built-in Observability Endpoints:** `/_edgegate/healthz` and `/_edgegate/metrics` exposing config generation and atomic allow/block/error/reload counters alongside structured JSON audit logs.
 
 ## Quickstart
 
@@ -22,10 +20,10 @@ High-performance, programmable L7 reverse proxy and load balancer written in Rus
 # Validate configuration
 cargo run -- validate --config edgegate.demo.toml
 
-# Start EdgeGate
-cargo run -- start --config edgegate.demo.toml
+# Start EdgeGate with 1s zero-downtime hot-reload file watching
+cargo run -- start --config edgegate.demo.toml --watch-interval-ms 1000
 
-# Run unit + adversarial security tests
+# Run all unit, adversarial security, and Milestone 2 integration tests
 cargo test --all-targets
 ```
 
@@ -51,14 +49,7 @@ Added p95 overhead: 906us (0.906ms)
 
 ## Architecture & Documentation
 
-- **Architecture Decision Record:** [docs/adr/001-explicit-l7-gateway-architecture.md](docs/adr/001-explicit-l7-gateway-architecture.md)
+- **ADR-001 (Milestone 1 Core Architecture):** [docs/adr/001-explicit-l7-gateway-architecture.md](docs/adr/001-explicit-l7-gateway-architecture.md)
+- **ADR-002 (Milestone 2 TLS, Hot Reload, UDS & RBAC):** [docs/adr/002-milestone-2-tls-hot-reload-uds-and-rbac.md](docs/adr/002-milestone-2-tls-hot-reload-uds-and-rbac.md)
 - **Threat Model & Non-Goals:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Engineering Standards:** [AGENTS.md](AGENTS.md)
-
-## Roadmap (Milestone 2+)
-
-- Inbound and outbound TLS (`rustls`), HTTP/2, and HTTP/3.
-- Atomic zero-downtime configuration hot reload (`ArcSwap<CompiledConfig>`).
-- External secret manager integrations (GCP Secret Manager, Vault) behind `SecretProvider`.
-- Transport-level workload identity (Unix domain sockets / sandbox runtime integration) behind `WorkloadAuthenticator`.
-- Active health checks, circuit breakers, traffic shadowing/replay, and OpenTelemetry tracing.
