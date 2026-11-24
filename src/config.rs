@@ -37,6 +37,9 @@ pub struct ServerConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_response_timeout_ms")]
     pub response_timeout_ms: u64,
+    /// Bounded flight-recorder ring buffer capacity for failed/shadow-mismatched requests (`Milestone 3`).
+    #[serde(default = "default_replay_buffer_size")]
+    pub replay_buffer_size: usize,
     /// Optional zero-token Unix domain socket listeners bound to specific workload identities.
     #[serde(default)]
     pub unix_listeners: Vec<UnixListenerConfig>,
@@ -96,6 +99,8 @@ pub enum LbStrategyConfig {
     #[default]
     RoundRobin,
     LeastConnections,
+    ConsistentHash,
+    LatencyAware,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +114,9 @@ pub struct BackendConfig {
     /// Optional SNI hostname override when `tls = true` (defaults to backend host).
     #[serde(default)]
     pub tls_sni: Option<String>,
+    /// Use HTTP/2 (`h2` via TLS ALPN or prior-knowledge `h2c`) for outbound connections (`Milestone 3`).
+    #[serde(default)]
+    pub http2: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +128,9 @@ pub struct RouteConfig {
     #[serde(default)]
     pub strip_prefix: bool,
     pub pool: String,
+    /// Optional shadow upstream pool for asynchronous live traffic mirroring & status diffing (`Milestone 3`).
+    #[serde(default)]
+    pub shadow_pool: Option<String>,
     /// Optional scoped credential injection binding.
     #[serde(default)]
     pub credential: Option<CredentialBindingConfig>,
@@ -173,6 +184,10 @@ fn default_response_timeout_ms() -> u64 {
     10_000
 }
 
+fn default_replay_buffer_size() -> usize {
+    64
+}
+
 fn default_max_conns_per_upstream() -> usize {
     64
 }
@@ -204,6 +219,7 @@ pub struct CompiledConfig {
     pub max_request_body_bytes: usize,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    pub replay_buffer_size: usize,
     pub unix_listeners: Vec<CompiledUnixListener>,
     pub workloads: HashMap<[u8; 32], CompiledWorkload>,
     pub pools: HashMap<String, CompiledPool>,
@@ -248,6 +264,7 @@ pub struct CompiledBackend {
     pub authority: String,
     pub tls: bool,
     pub tls_sni: String,
+    pub http2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +274,7 @@ pub struct CompiledRoute {
     pub host: Option<String>,
     pub strip_prefix: bool,
     pub pool: String,
+    pub shadow_pool: Option<String>,
     pub credential: Option<CompiledCredentialBinding>,
 }
 
@@ -458,6 +476,7 @@ impl CompiledConfig {
                     authority: b.address,
                     tls: b.tls,
                     tls_sni,
+                    http2: b.http2,
                 });
             }
 
@@ -510,6 +529,14 @@ impl CompiledConfig {
                     r.id, r.pool
                 )));
             }
+            if let Some(ref sp) = r.shadow_pool {
+                if !pools.contains_key(sp) {
+                    return Err(EdgeGateError::Config(format!(
+                        "route '{}' references unknown shadow_pool '{}'",
+                        r.id, sp
+                    )));
+                }
+            }
             let credential = match r.credential {
                 Some(c) => {
                     if c.credential_ref.trim().is_empty() {
@@ -540,6 +567,7 @@ impl CompiledConfig {
                 host: r.host.map(|h| h.to_ascii_lowercase()),
                 strip_prefix: r.strip_prefix,
                 pool: r.pool,
+                shadow_pool: r.shadow_pool,
                 credential,
             });
         }
@@ -624,6 +652,7 @@ impl CompiledConfig {
             max_request_body_bytes: raw.server.max_request_body_bytes,
             connect_timeout: Duration::from_millis(raw.server.connect_timeout_ms),
             response_timeout: Duration::from_millis(raw.server.response_timeout_ms),
+            replay_buffer_size: raw.server.replay_buffer_size.max(1),
             unix_listeners,
             workloads,
             pools,
@@ -710,11 +739,11 @@ roles = ["repo:read"]
 
 [[pools]]
 name = "mock-api"
-strategy = "round_robin"
+strategy = "consistent_hash"
 allow_private_ip = true
 backends = [
-  { id = "a", address = "127.0.0.1:9001", tls = false },
-  { id = "b", address = "127.0.0.1:9002", tls = true, tls_sni = "api.internal" },
+  { id = "a", address = "127.0.0.1:9001", tls = false, http2 = true },
+  { id = "b", address = "127.0.0.1:9002", tls = true, tls_sni = "api.internal", http2 = true },
 ]
 
 [[routes]]

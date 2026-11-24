@@ -10,8 +10,9 @@ use http::header::{CONNECTION, HOST};
 use http::{Method, Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
-use hyper::client::conn::http1::{self, SendRequest};
-use hyper_util::rt::TokioIo;
+use hyper::client::conn::http1::{self, SendRequest as Http1SendRequest};
+use hyper::client::conn::http2::{self, SendRequest as Http2SendRequest};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use pin_project_lite::pin_project;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -23,37 +24,17 @@ use crate::config::{CompiledBackend, CompiledPool};
 use crate::lb::BackendLease;
 use crate::EdgeGateError;
 
-// Single-flight HTTP/1.1 connection pool lifecycle (with optional outbound rustls TLS):
-//
-//   acquire Semaphore permit (bounded; try_acquire -> 503 local backpressure, NO LB ejection)
-//        │
-//        ▼
-//   pop idle SendRequest (discard expired idle_ttl or sender.is_closed())
-//        ├── hit  ──► poll_ready()
-//        └── miss ──► lookup_host -> validate EVERY IPv4/IPv6/::ffff: IP -> TcpStream::connect(validated_addr)
-//                                  -> [if backend.tls: TlsConnector::connect(sni)]
-//                                  -> hyper http1::handshake -> spawn conn driver
-//        │
-//        ▼
-//   sender.send_request(req) (with response_timeout; NO auto-retry, NO 3xx auto-follow)
-//        │
-//        ▼
-//   wrap Incoming body in PooledBody { inner, state: Some(PoolReturnState) }
-//        ├── poll_frame sees None (EOF) + !Connection:close + sender.is_ready()
-//        │        ──► push SendRequest back to idle VecDeque; drop permit & LB lease
-//        └── error / client drop / partial drain / Connection:close
-//                 ──► Drop discards SendRequest (closes socket) & releases permit + LB lease
-
 #[derive(Debug)]
-struct IdleConn {
-    sender: SendRequest<Full<Bytes>>,
+struct IdleHttp1Conn {
+    sender: Http1SendRequest<Full<Bytes>>,
     returned_at: Instant,
 }
 
 #[derive(Clone)]
 struct UpstreamSlot {
     semaphore: Arc<Semaphore>,
-    idle: Arc<Mutex<VecDeque<IdleConn>>>,
+    idle_http1: Arc<Mutex<VecDeque<IdleHttp1Conn>>>,
+    h2_sender: Arc<Mutex<Option<Http2SendRequest<Full<Bytes>>>>>,
     idle_ttl: Duration,
     tls_connector: Option<TlsConnector>,
 }
@@ -71,15 +52,16 @@ impl UpstreamSlot {
     fn new(max_conns: usize, idle_ttl: Duration, tls_connector: Option<TlsConnector>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_conns)),
-            idle: Arc::new(Mutex::new(VecDeque::new())),
+            idle_http1: Arc::new(Mutex::new(VecDeque::new())),
+            h2_sender: Arc::new(Mutex::new(None)),
             idle_ttl,
             tls_connector,
         }
     }
 
-    fn pop_fresh_idle(&self) -> Option<SendRequest<Full<Bytes>>> {
+    fn pop_fresh_http1(&self) -> Option<Http1SendRequest<Full<Bytes>>> {
         let now = Instant::now();
-        let mut guard = match self.idle.lock() {
+        let mut guard = match self.idle_http1.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -94,20 +76,41 @@ impl UpstreamSlot {
         }
         None
     }
+
+    fn get_fresh_h2(&self) -> Option<Http2SendRequest<Full<Bytes>>> {
+        let mut guard = match self.h2_sender.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(ref sender) = *guard {
+            if !sender.is_closed() {
+                return Some(sender.clone());
+            }
+        }
+        *guard = None;
+        None
+    }
+
+    fn store_h2(&self, sender: Http2SendRequest<Full<Bytes>>) {
+        let mut guard = match self.h2_sender.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(sender);
+    }
 }
 
 struct PoolReturnState {
-    sender: SendRequest<Full<Bytes>>,
-    idle_queue: Arc<Mutex<VecDeque<IdleConn>>>,
+    http1_sender: Option<Http1SendRequest<Full<Bytes>>>,
+    idle_queue: Arc<Mutex<VecDeque<IdleHttp1Conn>>>,
     connection_close: bool,
     _permit: OwnedSemaphorePermit,
     _lb_lease: BackendLease,
 }
 
 pin_project! {
-    /// Streams an upstream `hyper::body::Incoming` response while holding the single-flight
-    /// `SendRequest`, pool semaphore permit, and LB `BackendLease`.
-    /// Returns the `SendRequest` to the idle queue ONLY after full EOF drain.
+    /// Streams an upstream `hyper::body::Incoming` response while holding the
+    /// pool semaphore permit, LB `BackendLease`, and (for HTTP/1.1) single-flight `SendRequest`.
     pub struct PooledBody {
         #[pin]
         inner: Incoming,
@@ -117,16 +120,18 @@ pin_project! {
 
 impl PooledBody {
     fn try_return_clean(&mut self) {
-        if let Some(state) = self.state.take() {
-            if !state.connection_close && !state.sender.is_closed() && state.sender.is_ready() {
-                let mut guard = match state.idle_queue.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.push_back(IdleConn {
-                    sender: state.sender,
-                    returned_at: Instant::now(),
-                });
+        if let Some(mut state) = self.state.take() {
+            if let Some(sender) = state.http1_sender.take() {
+                if !state.connection_close && !sender.is_closed() && sender.is_ready() {
+                    let mut guard = match state.idle_queue.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.push_back(IdleHttp1Conn {
+                        sender,
+                        returned_at: Instant::now(),
+                    });
+                }
             }
         }
     }
@@ -148,19 +153,18 @@ impl Body for PooledBody {
         match this.inner.poll_frame(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                if let Some(state) = this.state.take() {
-                    if !state.connection_close
-                        && !state.sender.is_closed()
-                        && state.sender.is_ready()
-                    {
-                        let mut guard = match state.idle_queue.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        guard.push_back(IdleConn {
-                            sender: state.sender,
-                            returned_at: Instant::now(),
-                        });
+                if let Some(mut state) = this.state.take() {
+                    if let Some(sender) = state.http1_sender.take() {
+                        if !state.connection_close && !sender.is_closed() && sender.is_ready() {
+                            let mut guard = match state.idle_queue.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.push_back(IdleHttp1Conn {
+                                sender,
+                                returned_at: Instant::now(),
+                            });
+                        }
                     }
                 }
                 Poll::Ready(None)
@@ -182,8 +186,8 @@ impl Body for PooledBody {
     }
 }
 
-/// Bounded per-upstream HTTP/1.1 connection pool with resolve-validate-connect SSRF protection
-/// and optional `rustls` outbound TLS.
+/// Bounded per-upstream HTTP/1.1 & HTTP/2 connection pool with resolve-validate-connect SSRF protection
+/// and optional `rustls` outbound TLS (with ALPN `h2` when `backend.http2 == true`).
 #[derive(Debug)]
 pub struct ConnectionPool {
     slots: HashMap<(String, String), UpstreamSlot>,
@@ -199,9 +203,12 @@ impl ConnectionPool {
     ) -> Self {
         let mut slots = HashMap::new();
         for (pool_name, pool) in compiled {
-            let pool_tls = build_tls_connector(&pool.custom_ca_certs);
             for backend in &pool.backends {
-                let tls_connector = if backend.tls { pool_tls.clone() } else { None };
+                let tls_connector = if backend.tls {
+                    build_tls_connector(&pool.custom_ca_certs, backend.http2)
+                } else {
+                    None
+                };
                 slots.insert(
                     (pool_name.clone(), backend.id.clone()),
                     UpstreamSlot::new(
@@ -239,10 +246,14 @@ impl ConnectionPool {
             ))
         })?;
 
-        let mut sender = match slot.pop_fresh_idle() {
+        if lease.backend.http2 {
+            return self.send_http2(slot, permit, lease, request).await;
+        }
+
+        let mut sender = match slot.pop_fresh_http1() {
             Some(idle_sender) => idle_sender,
             None => {
-                self.dial_validated(
+                self.dial_http1_validated(
                     &lease.backend,
                     lease.allow_private_ip,
                     slot.tls_connector.as_ref(),
@@ -259,7 +270,7 @@ impl ConnectionPool {
             .is_err()
         {
             sender = self
-                .dial_validated(
+                .dial_http1_validated(
                     &lease.backend,
                     lease.allow_private_ip,
                     slot.tls_connector.as_ref(),
@@ -296,8 +307,8 @@ impl ConnectionPool {
         let mut pooled_body = PooledBody {
             inner: incoming,
             state: Some(PoolReturnState {
-                sender,
-                idle_queue: Arc::clone(&slot.idle),
+                http1_sender: Some(sender),
+                idle_queue: Arc::clone(&slot.idle_http1),
                 connection_close,
                 _permit: permit,
                 _lb_lease: lease,
@@ -315,8 +326,84 @@ impl ConnectionPool {
         Ok(Response::from_parts(parts, pooled_body))
     }
 
-    /// Executes an active HTTP health probe (`GET <health_check_path>`) against a backend,
-    /// returning `true` if it responds with a `2xx` status code within `connect_timeout`.
+    async fn send_http2(
+        &self,
+        slot: &UpstreamSlot,
+        permit: OwnedSemaphorePermit,
+        lease: BackendLease,
+        mut request: Request<Full<Bytes>>,
+    ) -> Result<Response<PooledBody>, EdgeGateError> {
+        // HTTP/2 uses `:authority` pseudo-header (derived from URI authority or Host header);
+        // remove `Host` header if URI has authority or keep URI path-and-query clean.
+        request.headers_mut().remove(CONNECTION);
+
+        let mut sender = match slot.get_fresh_h2() {
+            Some(s) => s,
+            None => {
+                let dialed = self
+                    .dial_http2_validated(
+                        &lease.backend,
+                        lease.allow_private_ip,
+                        slot.tls_connector.as_ref(),
+                    )
+                    .await?;
+                slot.store_h2(dialed.clone());
+                dialed
+            }
+        };
+
+        if tokio::time::timeout(self.connect_timeout, sender.ready())
+            .await
+            .map_err(|_| {
+                EdgeGateError::GatewayTimeout("upstream HTTP/2 readiness timeout".to_string())
+            })?
+            .is_err()
+        {
+            let dialed = self
+                .dial_http2_validated(
+                    &lease.backend,
+                    lease.allow_private_ip,
+                    slot.tls_connector.as_ref(),
+                )
+                .await?;
+            slot.store_h2(dialed.clone());
+            sender = dialed;
+            tokio::time::timeout(self.connect_timeout, sender.ready())
+                .await
+                .map_err(|_| {
+                    EdgeGateError::GatewayTimeout(
+                        "fresh upstream HTTP/2 readiness timeout".to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    EdgeGateError::BadGateway(format!("upstream HTTP/2 not ready: {e}"))
+                })?;
+        }
+
+        let response = tokio::time::timeout(self.response_timeout, sender.send_request(request))
+            .await
+            .map_err(|_| {
+                EdgeGateError::GatewayTimeout("upstream HTTP/2 response timeout".to_string())
+            })?
+            .map_err(|e| {
+                EdgeGateError::BadGateway(format!("upstream HTTP/2 transport error: {e}"))
+            })?;
+
+        let (parts, incoming) = response.into_parts();
+        let pooled_body = PooledBody {
+            inner: incoming,
+            state: Some(PoolReturnState {
+                http1_sender: None,
+                idle_queue: Arc::clone(&slot.idle_http1),
+                connection_close: false,
+                _permit: permit,
+                _lb_lease: lease,
+            }),
+        };
+
+        Ok(Response::from_parts(parts, pooled_body))
+    }
+
     pub async fn probe_backend_health(
         &self,
         pool_name: &str,
@@ -327,7 +414,7 @@ impl ConnectionPool {
         let key = (pool_name.to_string(), backend.id.clone());
         let tls_connector = self.slots.get(&key).and_then(|s| s.tls_connector.as_ref());
         let Ok(mut sender) = self
-            .dial_validated(backend, allow_private_ip, tls_connector)
+            .dial_http1_validated(backend, allow_private_ip, tls_connector)
             .await
         else {
             return false;
@@ -353,12 +440,12 @@ impl ConnectionPool {
         status_ok
     }
 
-    async fn dial_validated(
+    async fn dial_http1_validated(
         &self,
         backend: &CompiledBackend,
         allow_private_ip: bool,
         tls_connector: Option<&TlsConnector>,
-    ) -> Result<SendRequest<Full<Bytes>>, EdgeGateError> {
+    ) -> Result<Http1SendRequest<Full<Bytes>>, EdgeGateError> {
         let validated_addr =
             resolve_and_validate_addr(&backend.host, backend.port, allow_private_ip).await?;
         let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(validated_addr))
@@ -408,9 +495,70 @@ impl ConnectionPool {
 
         Ok(sender)
     }
+
+    async fn dial_http2_validated(
+        &self,
+        backend: &CompiledBackend,
+        allow_private_ip: bool,
+        tls_connector: Option<&TlsConnector>,
+    ) -> Result<Http2SendRequest<Full<Bytes>>, EdgeGateError> {
+        let validated_addr =
+            resolve_and_validate_addr(&backend.host, backend.port, allow_private_ip).await?;
+        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(validated_addr))
+            .await
+            .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
+            .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
+
+        let _ = stream.set_nodelay(true);
+
+        if backend.tls {
+            let connector = tls_connector.ok_or_else(|| {
+                EdgeGateError::BadGateway(
+                    "TLS enabled on backend but TLS connector unavailable".to_string(),
+                )
+            })?;
+            let server_name = ServerName::try_from(backend.tls_sni.clone()).map_err(|e| {
+                EdgeGateError::BadGateway(format!("invalid TLS SNI '{}': {e}", backend.tls_sni))
+            })?;
+            let tls_stream =
+                tokio::time::timeout(self.connect_timeout, connector.connect(server_name, stream))
+                    .await
+                    .map_err(|_| {
+                        EdgeGateError::GatewayTimeout("upstream TLS handshake timeout".to_string())
+                    })?
+                    .map_err(|e| {
+                        EdgeGateError::BadGateway(format!("upstream TLS handshake failed: {e}"))
+                    })?;
+
+            let io = TokioIo::new(tls_stream);
+            let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+                .await
+                .map_err(|e| {
+                    EdgeGateError::BadGateway(format!("HTTPS HTTP/2 handshake failed: {e}"))
+                })?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            return Ok(sender);
+        }
+
+        let io = TokioIo::new(stream);
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+            .await
+            .map_err(|e| EdgeGateError::BadGateway(format!("HTTP/2 h2c handshake failed: {e}")))?;
+
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        Ok(sender)
+    }
 }
 
-fn build_tls_connector(custom_ca_certs: &[CertificateDer<'static>]) -> Option<TlsConnector> {
+fn build_tls_connector(
+    custom_ca_certs: &[CertificateDer<'static>],
+    enable_h2_alpn: bool,
+) -> Option<TlsConnector> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for cert in custom_ca_certs {
@@ -419,18 +567,17 @@ fn build_tls_connector(custom_ca_certs: &[CertificateDer<'static>]) -> Option<Tl
         }
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .ok()?
         .with_root_certificates(root_store)
         .with_no_client_auth();
+    if enable_h2_alpn {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
     Some(TlsConnector::from(Arc::new(config)))
 }
 
-/// Resolve-validate-connect SSRF guard:
-/// Resolves `host:port`, checks EVERY resolved IPv4, IPv6, and unwrapped IPv4-mapped IPv6
-/// address against the SSRF blocklist unless `allow_private_ip` is explicitly `true`,
-/// and returns the validated `SocketAddr` to dial directly (preventing DNS-rebinding TOCTOU).
 pub async fn resolve_and_validate_addr(
     host: &str,
     port: u16,
