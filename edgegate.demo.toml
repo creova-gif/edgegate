@@ -1,0 +1,68 @@
+[server]
+listen_addr = "0.0.0.0:8080"
+max_request_body_bytes = 1048576
+connect_timeout_ms = 2000
+response_timeout_ms = 10000
+
+[[workloads]]
+workload_id = "sandbox-alpha"
+org_id = "org-alpha"
+token = "eg-demo-token-alpha"
+
+[[workloads]]
+workload_id = "sandbox-beta"
+org_id = "org-beta"
+token = "eg-demo-token-beta"
+
+[[pools]]
+name = "mock-github"
+strategy = "round_robin"
+max_connections_per_upstream = 32
+idle_ttl_ms = 30000
+passive_failure_threshold = 3
+passive_cooldown_ms = 5000
+allow_private_ip = true
+backends = [
+  { id = "upstream-a", address = "upstream-a:9001" },
+  { id = "upstream-b", address = "upstream-b:9002" },
+]
+
+[[pools]]
+name = "ssrf-blocked"
+strategy = "round_robin"
+allow_private_ip = false
+backends = [
+  { id = "cloud-metadata", address = "169.254.169.254:80" },
+]
+
+[[routes]]
+id = "github"
+path_prefix = "/v1/github"
+strip_prefix = true
+pool = "mock-github"
+[routes.credential]
+credential_ref = "github_pat"
+header_name = "Authorization"
+value_prefix = "Bearer "
+
+[[routes]]
+id = "metadata-ssrf"
+path_prefix = "/v1/metadata"
+pool = "ssrf-blocked"
+
+[[policies]]
+org_id = "org-alpha"
+route_id = "github"
+methods = ["GET"]
+path_prefix = "/v1/github/repos"
+
+[[policies]]
+org_id = "org-alpha"
+route_id = "metadata-ssrf"
+methods = ["GET"]
+path_prefix = "/v1/metadata"
+
+[[secrets]]
+org_id = "org-alpha"
+credential_ref = "github_pat"
+value = "ghp_demo_scoped_secret_alpha"

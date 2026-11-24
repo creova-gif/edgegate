@@ -1,0 +1,28 @@
+[package]
+name = "edgegate"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance programmable L7 reverse proxy and load balancer for zero-secret workload execution"
+
+[dependencies]
+arc-swap = "1.7"
+bytes = "1.7"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+http = "1.1"
+http-body-util = "0.1"
+hyper = { version = "1.4", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+pin-project-lite = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
