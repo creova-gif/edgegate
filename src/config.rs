@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderName, Method};
+use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -35,6 +37,18 @@ pub struct ServerConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_response_timeout_ms")]
     pub response_timeout_ms: u64,
+    /// Optional zero-token Unix domain socket listeners bound to specific workload identities.
+    #[serde(default)]
+    pub unix_listeners: Vec<UnixListenerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnixListenerConfig {
+    pub path: PathBuf,
+    pub workload_id: String,
+    pub org_id: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +58,8 @@ pub struct WorkloadConfig {
     /// Either plaintext `token` (hashed at startup for local dev/demo) or pre-hashed `token_sha256` (64 hex chars).
     pub token: Option<String>,
     pub token_sha256: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +80,14 @@ pub struct PoolConfig {
     /// Defaults to `false` (strict SSRF blocklist enforced).
     #[serde(default)]
     pub allow_private_ip: bool,
+    /// Optional custom CA certificate PEM bundle for outbound TLS verification on this pool.
+    #[serde(default)]
+    pub ca_cert_pem: Option<String>,
+    /// Optional active HTTP health probe path (e.g. `"/healthz"`).
+    #[serde(default)]
+    pub health_check_path: Option<String>,
+    #[serde(default = "default_health_check_interval_ms")]
+    pub health_check_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -77,8 +101,14 @@ pub enum LbStrategyConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackendConfig {
     pub id: String,
-    /// Authority in `host:port` format (plaintext HTTP/1.1 in Milestone 1).
+    /// Authority in `host:port` format.
     pub address: String,
+    /// Enable outbound TLS (`rustls`) to this backend.
+    #[serde(default)]
+    pub tls: bool,
+    /// Optional SNI hostname override when `tls = true` (defaults to backend host).
+    #[serde(default)]
+    pub tls_sni: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +141,9 @@ pub struct PolicyRuleConfig {
     /// Optional workload_id restriction; if omitted, applies to all workloads in `org_id`.
     #[serde(default)]
     pub workload_id: Option<String>,
+    /// Optional RBAC roles required on the authenticated workload.
+    #[serde(default)]
+    pub required_roles: Vec<String>,
     pub route_id: String,
     pub methods: Vec<String>,
     #[serde(default = "default_path_prefix")]
@@ -121,7 +154,11 @@ pub struct PolicyRuleConfig {
 pub struct SecretEntryConfig {
     pub org_id: String,
     pub credential_ref: String,
-    pub value: String,
+    /// Inline secret value (for local dev/tests) OR `env` variable name to read from process environment.
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub env: Option<String>,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -152,17 +189,22 @@ fn default_cooldown_ms() -> u64 {
     5_000
 }
 
+fn default_health_check_interval_ms() -> u64 {
+    5_000
+}
+
 fn default_path_prefix() -> String {
     "/".to_string()
 }
 
-/// Immutable, validated runtime snapshot stored in `ArcSwap<CompiledConfig>`.
+/// Immutable, validated runtime snapshot stored in `ArcSwap<RuntimeSnapshot>`.
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
     pub listen_addr: SocketAddr,
     pub max_request_body_bytes: usize,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    pub unix_listeners: Vec<CompiledUnixListener>,
     pub workloads: HashMap<[u8; 32], CompiledWorkload>,
     pub pools: HashMap<String, CompiledPool>,
     pub routes: Vec<CompiledRoute>,
@@ -171,9 +213,16 @@ pub struct CompiledConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledUnixListener {
+    pub path: PathBuf,
+    pub workload: CompiledWorkload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledWorkload {
     pub workload_id: String,
     pub org_id: String,
+    pub roles: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +235,9 @@ pub struct CompiledPool {
     pub passive_failure_threshold: u32,
     pub passive_cooldown: Duration,
     pub allow_private_ip: bool,
+    pub custom_ca_certs: Vec<CertificateDer<'static>>,
+    pub health_check_path: Option<String>,
+    pub health_check_interval: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +246,8 @@ pub struct CompiledBackend {
     pub host: String,
     pub port: u16,
     pub authority: String,
+    pub tls: bool,
+    pub tls_sni: String,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +271,7 @@ pub struct CompiledCredentialBinding {
 pub struct CompiledPolicyRule {
     pub org_id: String,
     pub workload_id: Option<String>,
+    pub required_roles: HashSet<String>,
     pub route_id: String,
     pub methods: HashSet<Method>,
     pub path_prefix: String,
@@ -253,6 +308,30 @@ impl CompiledConfig {
             return Err(EdgeGateError::Config(
                 "server timeouts must be > 0".to_string(),
             ));
+        }
+
+        let mut unix_listeners = Vec::with_capacity(raw.server.unix_listeners.len());
+        let mut seen_uds_paths = HashSet::new();
+        for u in raw.server.unix_listeners {
+            if u.workload_id.trim().is_empty() || u.org_id.trim().is_empty() {
+                return Err(EdgeGateError::Config(
+                    "unix_listener workload_id and org_id must be non-empty".to_string(),
+                ));
+            }
+            if u.path.as_os_str().is_empty() || !seen_uds_paths.insert(u.path.clone()) {
+                return Err(EdgeGateError::Config(format!(
+                    "empty or duplicate unix_listener path '{}'",
+                    u.path.display()
+                )));
+            }
+            unix_listeners.push(CompiledUnixListener {
+                path: u.path,
+                workload: CompiledWorkload {
+                    workload_id: u.workload_id,
+                    org_id: u.org_id,
+                    roles: u.roles.into_iter().collect(),
+                },
+            });
         }
 
         let mut workloads = HashMap::with_capacity(raw.workloads.len());
@@ -297,6 +376,7 @@ impl CompiledConfig {
                     CompiledWorkload {
                         workload_id: w.workload_id.clone(),
                         org_id: w.org_id,
+                        roles: w.roles.into_iter().collect(),
                     },
                 )
                 .is_some()
@@ -333,6 +413,21 @@ impl CompiledConfig {
                     p.name
                 )));
             }
+            if let Some(ref hc_path) = p.health_check_path {
+                if !hc_path.starts_with('/') {
+                    return Err(EdgeGateError::Config(format!(
+                        "pool '{}' health_check_path '{}' must start with '/'",
+                        p.name, hc_path
+                    )));
+                }
+            }
+
+            let custom_ca_certs = match p.ca_cert_pem {
+                Some(ref pem) => parse_pem_certs(pem).map_err(|msg| {
+                    EdgeGateError::Config(format!("pool '{}' invalid ca_cert_pem: {msg}", p.name))
+                })?,
+                None => Vec::new(),
+            };
 
             let mut compiled_backends = Vec::with_capacity(p.backends.len());
             let mut seen_ids = HashSet::new();
@@ -349,11 +444,20 @@ impl CompiledConfig {
                         p.name, b.id, b.address
                     ))
                 })?;
+                let tls_sni = b.tls_sni.unwrap_or_else(|| host.clone());
+                if b.tls && tls_sni.trim().is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "pool '{}' backend '{}' tls_sni must be non-empty",
+                        p.name, b.id
+                    )));
+                }
                 compiled_backends.push(CompiledBackend {
                     id: b.id,
                     host,
                     port,
                     authority: b.address,
+                    tls: b.tls,
+                    tls_sni,
                 });
             }
 
@@ -369,6 +473,11 @@ impl CompiledConfig {
                         passive_failure_threshold: p.passive_failure_threshold,
                         passive_cooldown: Duration::from_millis(p.passive_cooldown_ms),
                         allow_private_ip: p.allow_private_ip,
+                        custom_ca_certs,
+                        health_check_path: p.health_check_path,
+                        health_check_interval: Duration::from_millis(
+                            p.health_check_interval_ms.max(100),
+                        ),
                     },
                 )
                 .is_some()
@@ -434,7 +543,6 @@ impl CompiledConfig {
                 credential,
             });
         }
-        // Sort longest path_prefix first for deterministic matching.
         routes.sort_by(|a, b| {
             b.path_prefix
                 .len()
@@ -473,6 +581,7 @@ impl CompiledConfig {
             policies.push(CompiledPolicyRule {
                 org_id: pol.org_id,
                 workload_id: pol.workload_id,
+                required_roles: pol.required_roles.into_iter().collect(),
                 route_id: pol.route_id,
                 methods,
                 path_prefix: pol.path_prefix,
@@ -486,7 +595,28 @@ impl CompiledConfig {
                     "secret org_id and credential_ref must be non-empty".to_string(),
                 ));
             }
-            secrets.insert((s.org_id, s.credential_ref), s.value);
+            let resolved_value = match (s.value, s.env) {
+                (Some(val), None) => val,
+                (None, Some(env_var)) => std::env::var(&env_var).map_err(|_| {
+                    EdgeGateError::Config(format!(
+                        "secret '{}' for org '{}' requires unset environment variable '{}'",
+                        s.credential_ref, s.org_id, env_var
+                    ))
+                })?,
+                (Some(_), Some(_)) => {
+                    return Err(EdgeGateError::Config(format!(
+                        "secret '{}' cannot set both value and env",
+                        s.credential_ref
+                    )));
+                }
+                (None, None) => {
+                    return Err(EdgeGateError::Config(format!(
+                        "secret '{}' must set either value or env",
+                        s.credential_ref
+                    )));
+                }
+            };
+            secrets.insert((s.org_id, s.credential_ref), resolved_value);
         }
 
         Ok(Self {
@@ -494,6 +624,7 @@ impl CompiledConfig {
             max_request_body_bytes: raw.server.max_request_body_bytes,
             connect_timeout: Duration::from_millis(raw.server.connect_timeout_ms),
             response_timeout: Duration::from_millis(raw.server.response_timeout_ms),
+            unix_listeners,
             workloads,
             pools,
             routes,
@@ -520,6 +651,19 @@ fn decode_sha256_hex(hex_str: &str) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+fn parse_pem_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let mut reader = Cursor::new(pem.as_bytes());
+    let mut certs = Vec::new();
+    for item in rustls_pemfile::certs(&mut reader) {
+        let cert = item.map_err(|e| format!("failed to parse PEM certificate: {e}"))?;
+        certs.push(cert);
+    }
+    if certs.is_empty() {
+        return Err("no certificates found in ca_cert_pem".to_string());
+    }
+    Ok(certs)
 }
 
 fn parse_authority(authority: &str) -> Result<(String, u16), String> {
@@ -562,14 +706,15 @@ listen_addr = "127.0.0.1:8080"
 workload_id = "agent-1"
 org_id = "org-alpha"
 token = "tok-alpha-1"
+roles = ["repo:read"]
 
 [[pools]]
 name = "mock-api"
 strategy = "round_robin"
 allow_private_ip = true
 backends = [
-  { id = "a", address = "127.0.0.1:9001" },
-  { id = "b", address = "127.0.0.1:9002" },
+  { id = "a", address = "127.0.0.1:9001", tls = false },
+  { id = "b", address = "127.0.0.1:9002", tls = true, tls_sni = "api.internal" },
 ]
 
 [[routes]]
@@ -584,6 +729,7 @@ value_prefix = "Bearer "
 
 [[policies]]
 org_id = "org-alpha"
+required_roles = ["repo:read"]
 route_id = "github"
 methods = ["GET"]
 path_prefix = "/v1/github/repos"

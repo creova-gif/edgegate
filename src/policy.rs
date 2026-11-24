@@ -20,7 +20,7 @@ pub trait PolicyEngine: Send + Sync {
     ) -> PolicyDecision;
 }
 
-/// Default-deny policy engine checking `(org_id, workload_id, route_id, method, path_prefix)`.
+/// Default-deny policy engine checking `(org_id, workload_id, required_roles, route_id, method, path_prefix)`.
 #[derive(Debug, Clone)]
 pub struct DefaultDenyPolicyEngine {
     rules: Vec<CompiledPolicyRule>,
@@ -48,6 +48,13 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
                 if allowed_workload != &identity.workload_id {
                     continue;
                 }
+            }
+            if !rule
+                .required_roles
+                .iter()
+                .all(|req_role| identity.roles.contains(req_role))
+            {
+                continue;
             }
             if rule.route_id != route_id {
                 continue;
@@ -95,6 +102,7 @@ mod tests {
         DefaultDenyPolicyEngine::new(vec![CompiledPolicyRule {
             org_id: "org-alpha".to_string(),
             workload_id: Some("agent-1".to_string()),
+            required_roles: ["repo:read".to_string()].into_iter().collect(),
             route_id: "github".to_string(),
             methods,
             path_prefix: "/v1/github/repos".to_string(),
@@ -102,11 +110,12 @@ mod tests {
     }
 
     #[test]
-    fn allows_exact_org_workload_route_method_and_prefix() {
+    fn allows_exact_org_workload_roles_route_method_and_prefix() {
         let engine = sample_engine();
         let id = WorkloadIdentity {
             workload_id: "agent-1".to_string(),
             org_id: "org-alpha".to_string(),
+            roles: ["repo:read".to_string()].into_iter().collect(),
         };
         assert_eq!(
             engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
@@ -115,11 +124,26 @@ mod tests {
     }
 
     #[test]
+    fn denies_missing_required_role() {
+        let engine = sample_engine();
+        let id = WorkloadIdentity {
+            workload_id: "agent-1".to_string(),
+            org_id: "org-alpha".to_string(),
+            roles: HashSet::new(),
+        };
+        assert!(matches!(
+            engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn denies_cross_tenant_and_prefix_boundary_bypass() {
         let engine = sample_engine();
         let other_org = WorkloadIdentity {
             workload_id: "agent-1".to_string(),
             org_id: "org-beta".to_string(),
+            roles: ["repo:read".to_string()].into_iter().collect(),
         };
         assert!(matches!(
             engine.evaluate(&other_org, "github", &Method::GET, "/v1/github/repos"),
@@ -129,6 +153,7 @@ mod tests {
         let alpha = WorkloadIdentity {
             workload_id: "agent-1".to_string(),
             org_id: "org-alpha".to_string(),
+            roles: ["repo:read".to_string()].into_iter().collect(),
         };
         assert!(matches!(
             engine.evaluate(&alpha, "github", &Method::GET, "/v1/github/repos-admin"),

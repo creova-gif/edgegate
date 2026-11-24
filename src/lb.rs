@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,19 +23,22 @@ impl Drop for BackendLease {
     }
 }
 
-/// Trait seam for load balancing + passive backend health tracking.
+/// Trait seam for load balancing + passive/active backend health tracking.
 pub trait LoadBalancer: Send + Sync {
     fn select(&self, pool_name: &str) -> Result<BackendLease, EdgeGateError>;
     fn record_success(&self, pool_name: &str, backend_id: &str);
     /// Record a passive backend failure (`502` connect/transport, `504` timeout, or upstream `5xx`).
     /// NEVER call this on local `503` pool exhaustion.
     fn record_failure(&self, pool_name: &str, backend_id: &str);
+    /// Updates active health status from background HTTP health probes (`Milestone 2`).
+    fn set_active_health(&self, pool_name: &str, backend_id: &str, healthy: bool);
 }
 
 #[derive(Debug)]
 struct BackendState {
     config: CompiledBackend,
     in_flight: Arc<AtomicUsize>,
+    active_healthy: AtomicBool,
     health: Mutex<PassiveHealth>,
 }
 
@@ -47,6 +50,9 @@ struct PassiveHealth {
 
 impl BackendState {
     fn is_healthy(&self, now: Instant) -> bool {
+        if !self.active_healthy.load(Ordering::Acquire) {
+            return false;
+        }
         let mut guard = match self.health.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -55,7 +61,6 @@ impl BackendState {
             if now < until {
                 return false;
             }
-            // Cooldown expired: admit backend again with reset counter.
             guard.ejected_until = None;
             guard.consecutive_failures = 0;
         }
@@ -95,7 +100,7 @@ struct PoolState {
 }
 
 /// Pool-aware load balancer supporting both `RoundRobin` and `LeastConnections`
-/// plus passive error-based ejection with cooldown.
+/// plus passive error-based ejection and active probe health state.
 #[derive(Debug)]
 pub struct PoolLoadBalancer {
     pools: HashMap<String, PoolState>,
@@ -111,6 +116,7 @@ impl PoolLoadBalancer {
                 .map(|b| BackendState {
                     config: b.clone(),
                     in_flight: Arc::new(AtomicUsize::new(0)),
+                    active_healthy: AtomicBool::new(true),
                     health: Mutex::new(PassiveHealth {
                         consecutive_failures: 0,
                         ejected_until: None,
@@ -177,7 +183,7 @@ impl LoadBalancer for PoolLoadBalancer {
 
         let backend = selected.ok_or_else(|| {
             EdgeGateError::ServiceUnavailable(format!(
-                "all backends in pool '{pool_name}' are in passive failure cooldown"
+                "all backends in pool '{pool_name}' are unhealthy or in passive failure cooldown"
             ))
         })?;
 
@@ -209,6 +215,17 @@ impl LoadBalancer for PoolLoadBalancer {
             }
         }
     }
+
+    fn set_active_health(&self, pool_name: &str, backend_id: &str, healthy: bool) {
+        if let Some(pool) = self.pools.get(pool_name) {
+            if let Some(b) = pool.backends.iter().find(|b| b.config.id == backend_id) {
+                b.active_healthy.store(healthy, Ordering::Release);
+                if healthy {
+                    b.on_success();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -228,12 +245,16 @@ mod tests {
                         host: "127.0.0.1".to_string(),
                         port: 9001,
                         authority: "127.0.0.1:9001".to_string(),
+                        tls: false,
+                        tls_sni: "127.0.0.1".to_string(),
                     },
                     CompiledBackend {
                         id: "b".to_string(),
                         host: "127.0.0.1".to_string(),
                         port: 9002,
                         authority: "127.0.0.1:9002".to_string(),
+                        tls: false,
+                        tls_sni: "127.0.0.1".to_string(),
                     },
                 ],
                 max_connections_per_upstream: 8,
@@ -241,6 +262,9 @@ mod tests {
                 passive_failure_threshold: threshold,
                 passive_cooldown: Duration::from_millis(cooldown_ms),
                 allow_private_ip: true,
+                custom_ca_certs: Vec::new(),
+                health_check_path: None,
+                health_check_interval: Duration::from_secs(5),
             },
         );
         PoolLoadBalancer::from_pools(&pools)
@@ -263,12 +287,10 @@ mod tests {
         let held = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
         assert_eq!(held.backend.id, "a");
 
-        // While `a` holds 1 in-flight request, subsequent selections pick `b`.
         let second = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
         assert_eq!(second.backend.id, "b");
         drop(second);
 
-        // Still held on `a`, so next picks `b` again.
         let third = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
         assert_eq!(third.backend.id, "b");
         drop(held);
@@ -276,18 +298,21 @@ mod tests {
     }
 
     #[test]
-    fn passive_ejection_skips_failed_backend_and_fails_closed_when_all_ejected() {
+    fn passive_and_active_health_skip_unhealthy_backends() {
         let lb = make_pool(LbStrategyConfig::RoundRobin, 2, 5_000);
+        lb.set_active_health("api", "a", false);
+        let lease = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
+        assert_eq!(lease.backend.id, "b");
+
+        lb.set_active_health("api", "a", true);
         lb.record_failure("api", "a");
         lb.record_failure("api", "a");
 
-        // `a` is ejected; every pick goes to `b`.
         for _ in 0..4 {
             let lease = lb.select("api").unwrap_or_else(|e| panic!("err: {e}"));
             assert_eq!(lease.backend.id, "b");
         }
 
-        // Eject `b` too -> fail closed with 503.
         lb.record_failure("api", "b");
         lb.record_failure("api", "b");
         assert!(matches!(
