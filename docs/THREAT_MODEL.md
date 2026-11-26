@@ -1,13 +1,13 @@
-# EdgeGate Threat Model (Milestones 1–6 / `v0.6.0`)
+# EdgeGate Threat Model (Milestones 1–7 / `v0.7.0`)
 
 ## 1. Security Objective
 Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxlet microVMs/containers) to call explicitly authorized HTTP/1.1, HTTP/2, and HTTPS upstream services without possessing the underlying upstream API credentials or unrestricted outbound network authority.
 
 ## 2. Assets
-- **Upstream API credentials:** Scoped secrets held inside EdgeGate (`SecretProvider`, backed by process environment or config, with optional `expires_at_epoch_s` TTL enforcement and live in-memory rotation via `EdgeGateProxy::rotate_secret`), injected only into authorized outbound requests, and optionally guarded against upstream response reflection (`block_secret_reflection = true`).
-- **Tenant, role, & organizational boundaries (`org_id`, `roles`, `required_headers`):** Strict isolation ensuring a workload in `org_a` cannot access routes, roles, L7/MCP tool attributes, credentials, or pooled response streams belonging to `org_b`.
-- **Workload identity (`X-EdgeGate-Token` primary/secondary rollover or zero-token Unix Domain Socket / Boxlet guard):** Scoped gateway identity tokens (over TCP or inbound TLS 1.2/1.3 `[server.tls]`, supporting zero-downtime `secondary_token` / `secondary_token_sha256` rotation, never forwarded upstream) or host-mounted static/dynamic UDS listeners where identity comes from the socket boundary itself.
-- **Audit logs & flight-recorder replay buffer:** Structured JSON records of allow/deny decisions and sanitized failure, secret-reflection, and shadow-mismatch entries (`/_edgegate/replay`) that never contain raw credentials, headers, or request bodies.
+- **Upstream API credentials:** Scoped secrets held inside EdgeGate (`SecretProvider`, backed by process environment or config, with optional `expires_at_epoch_s` TTL enforcement and live in-memory rotation via `EdgeGateProxy::rotate_secret` or `/_edgegate/admin/secrets/rotate`), injected only into authorized outbound requests, and optionally guarded against upstream response reflection (`block_secret_reflection = true`).
+- **Tenant, role, & organizational boundaries (`org_id`, `roles`, `required_headers`, `forbidden_query_params`, `max_body_bytes`):** Strict isolation ensuring a workload in `org_a` cannot access routes, roles, L7/MCP tool attributes, forbidden query parameters, credentials, or pooled response streams belonging to `org_b`.
+- **Workload & Control-Plane identity (`X-EdgeGate-Token` primary/secondary rollover, `X-EdgeGate-Admin-Token`, or zero-token Unix Domain Socket / Boxlet guard):** Scoped gateway identity tokens (over TCP or inbound TLS 1.2/1.3 `[server.tls]`, supporting zero-downtime `secondary_token` / `secondary_token_sha256` rotation, never forwarded upstream), constant-time Admin Control Plane tokens (`server.admin_token` / `server.admin_token_sha256`, disabled fail-closed when unconfigured), or host-mounted static/dynamic UDS listeners where identity comes from the socket boundary itself.
+- **Tamper-evident audit ledger & flight-recorder replay buffer:** Cryptographic SHA-256 hash-chained audit ledger (`prev_hash` -> `entry_hash` over every gateway decision, verified at `/_edgegate/admin/audit` and `audit_chain_valid` in `/_edgegate/metrics`, `INV-16`), structured JSON logs, and sanitized failure, secret-reflection, and shadow-mismatch entries (`/_edgegate/replay`) that never contain raw credentials, headers, or request bodies.
 
 ## 3. Trust Boundaries
 ```text
@@ -18,10 +18,12 @@ Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxle
               ▼
    ╔═════════════════════════╗
    ║     EdgeGate Gateway    ║  <-- Enforces parse, path validation, dual-token/UDS identity,
-   ║   (trusted choke point) ║      RBAC & required_headers policy, rate limits, 3-state breaker,
-   ╚═════════════════════════╝      idempotent-only failover, SSRF guard, header strip,
-              │                     TTL-checked credential injection, no-redirect, reflection guard
-              ├──► Primary Upstream Pool (HTTP/1.1, HTTP/2 h2c/ALPN, rustls HTTPS)
+   ║   (trusted choke point) ║      RBAC, required_headers, forbidden_query_params & per-rule
+   ╚═════════════════════════╝      max_body_bytes policy, rate limits, weighted 3-state breaker,
+              │                     idempotent-only failover, SSRF guard, header strip,
+              │                     TTL-checked credential injection, no-redirect, reflection guard,
+              │                     SHA-256 hash-chained audit ledger & fail-closed Admin API
+              ├──► Primary Upstream Pool (HTTP/1.1, HTTP/2 h2c/ALPN, rustls HTTPS, weighted canary)
               └──► Optional Shadow Pool  (async non-blocking mirror + status diff)
 ```
 
@@ -45,6 +47,8 @@ Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxle
 | **Non-idempotent retry side-effect duplication** | **INV-13** | Upstream transport error during `POST`/`DELETE` triggers automatic failover retry, duplicating state mutations. | Idempotent-Only Retry Safety (`max_idempotent_retries` on `[[pools]]`): retries connect/transport errors exclusively for safe methods (`GET`, `HEAD`, `OPTIONS`) against the next healthy backend (`retries_total`) and never retries `POST`, `PUT`, `PATCH`, or `DELETE`. |
 | **Stale / expired upstream credential usage** | **INV-14** | Long-lived or expired upstream credential continues to be injected into outbound requests, or rotating a credential requires proxy downtime. | Scoped Credential Rotation & TTL Expiry (`expires_at_epoch_s` on `[[secrets]]`, `EdgeGateProxy::rotate_secret`): fails closed (`403 Forbidden`) when `now >= expires_at_epoch_s` and supports live in-memory secret rotation (`secret_rotations_total`) with immediate zeroization of superseded secrets. |
 | **Unauthorized MCP tool or L7 action invocation** | **INV-15** | Compromised agent authorized for an upstream route invokes a destructive MCP tool or unapproved L7 action on that route. | Programmable Request-Attribute Policy Matching (`required_headers` on `[[policies]]`, e.g., `required_headers = { "x-mcp-tool" = "github.read_repo" }`): enforces fine-grained L7 header/attribute predicates alongside Keelway MCP Gateway and IoRa, rejecting unauthorized tool calls with `403 Forbidden`. |
+| **Audit log tampering & decision repudiation, or unauthenticated control-plane mutation** | **INV-16** | Attacker attempts to alter/delete historical gateway audit records or invoke `/_edgegate/admin/reload`, `/_edgegate/admin/secrets/rotate`, or `/_edgegate/admin/audit` from an untrusted network. | Cryptographic SHA-256 Hash-Chained Tamper-Evident Audit Ledger (`prev_hash` -> `entry_hash` over every gateway decision, verified at `/_edgegate/admin/audit` and exported as `audit_chain_valid` in `/_edgegate/metrics`), plus constant-time `X-EdgeGate-Admin-Token` verification (`server.admin_token` / `server.admin_token_sha256`) that is disabled fail-closed (`403`) when unconfigured. |
+| **Query-parameter smuggling/exfiltration & per-route payload exhaustion** | **INV-17** | Compromised agent appends dangerous query parameters (e.g., `?debug=true`, `?raw_token=1`) to an allowed route prefix or sends oversized payloads to a sensitive endpoint. | Per-Rule Query-Parameter & Payload Resource Limits (`forbidden_query_params` and `max_body_bytes` on `[[policies]]`): blocks requests containing forbidden query parameters with `403 Forbidden` and enforces per-rule payload ceilings via `http_body_util::Limited` (`413 Payload Too Large`). |
 
 ## 5. Explicit Non-Goals & Residual Risks
 - **Obfuscated/encoded upstream credential reflection:** While `block_secret_reflection = true` (`INV-12`) blocks verbatim reflection of injected credentials in response headers and bodies (`502 Bad Gateway`), byte-pattern scrubbing cannot detect secrets that a malicious upstream deliberately base64-encodes, compresses, or encrypts inside a response payload.

@@ -2,7 +2,33 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
 use tracing::info;
+
+const GENESIS_AUDIT_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Cryptographic SHA-256 hash-chained audit ledger entry (`Milestone 7`).
+/// Strictly excludes request/response headers, bodies, and secret material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditChainEntry {
+    pub seq: u64,
+    pub request_id: u64,
+    pub trace_id: String,
+    pub org_id: String,
+    pub workload_id: String,
+    pub route: String,
+    pub decision: String,
+    pub status: u16,
+    pub prev_hash: String,
+    pub entry_hash: String,
+}
+
+#[derive(Debug)]
+struct AuditLedgerState {
+    seq: u64,
+    last_audit_hash: String,
+    entries: VecDeque<AuditChainEntry>,
+}
 
 /// Sanitized flight-recorder entry for failed (`5xx`/`502`/`503`/`504`), rate-limited (`429`), or shadow-mismatched requests.
 /// Strictly excludes request/response headers, bodies, and secret material.
@@ -22,7 +48,8 @@ pub struct ReplayRecord {
     pub latency_us: u64,
 }
 
-/// Atomic request, decision, rate-limit, shadow, reload, retry, reflection-guard, secret-rotation, and flight-recorder telemetry (`Milestone 6`).
+/// Atomic request, decision, rate-limit, shadow, reload, retry, reflection-guard, secret-rotation,
+/// latency histogram, flight-recorder, and SHA-256 hash-chained audit ledger telemetry (`Milestone 7`).
 #[derive(Debug)]
 pub struct Telemetry {
     request_seq: AtomicU64,
@@ -39,8 +66,17 @@ pub struct Telemetry {
     secret_rotations_total: AtomicU64,
     retries_total: AtomicU64,
     in_flight_requests: AtomicU64,
+    latency_le_100us: AtomicU64,
+    latency_le_500us: AtomicU64,
+    latency_le_1000us: AtomicU64,
+    latency_le_5000us: AtomicU64,
+    latency_le_10000us: AtomicU64,
+    latency_le_50000us: AtomicU64,
+    latency_sum_us: AtomicU64,
+    latency_count: AtomicU64,
     replay_capacity: usize,
     replay_ring: Mutex<VecDeque<ReplayRecord>>,
+    audit_ledger: Mutex<AuditLedgerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +124,21 @@ impl Telemetry {
             secret_rotations_total: AtomicU64::new(0),
             retries_total: AtomicU64::new(0),
             in_flight_requests: AtomicU64::new(0),
+            latency_le_100us: AtomicU64::new(0),
+            latency_le_500us: AtomicU64::new(0),
+            latency_le_1000us: AtomicU64::new(0),
+            latency_le_5000us: AtomicU64::new(0),
+            latency_le_10000us: AtomicU64::new(0),
+            latency_le_50000us: AtomicU64::new(0),
+            latency_sum_us: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
             replay_capacity: cap,
             replay_ring: Mutex::new(VecDeque::with_capacity(cap)),
+            audit_ledger: Mutex::new(AuditLedgerState {
+                seq: 0,
+                last_audit_hash: GENESIS_AUDIT_HASH.to_string(),
+                entries: VecDeque::with_capacity(cap),
+            }),
         }
     }
 
@@ -206,8 +255,9 @@ impl Telemetry {
 
     pub fn to_json(&self) -> String {
         let s = self.snapshot();
+        let audit_valid = self.verify_audit_chain();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"retries_total\":{},\"in_flight_requests\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -220,13 +270,22 @@ impl Telemetry {
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
             s.retries_total,
-            s.in_flight_requests
+            s.in_flight_requests,
+            audit_valid
         )
     }
 
-    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and gauges (`Milestone 6`).
+    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters, gauges, and latency histograms (`Milestone 7`).
     pub fn to_prometheus(&self) -> String {
         let s = self.snapshot();
+        let b100 = self.latency_le_100us.load(Ordering::Relaxed);
+        let b500 = self.latency_le_500us.load(Ordering::Relaxed);
+        let b1000 = self.latency_le_1000us.load(Ordering::Relaxed);
+        let b5000 = self.latency_le_5000us.load(Ordering::Relaxed);
+        let b10000 = self.latency_le_10000us.load(Ordering::Relaxed);
+        let b50000 = self.latency_le_50000us.load(Ordering::Relaxed);
+        let l_sum = self.latency_sum_us.load(Ordering::Relaxed);
+        let l_count = self.latency_count.load(Ordering::Relaxed);
         format!(
             "# HELP edgegate_requests_allowed_total Total requests allowed by EdgeGate policy.\n\
              # TYPE edgegate_requests_allowed_total counter\n\
@@ -266,7 +325,18 @@ impl Telemetry {
              edgegate_retries_total {}\n\
              # HELP edgegate_in_flight_requests Current number of in-flight requests being processed.\n\
              # TYPE edgegate_in_flight_requests gauge\n\
-             edgegate_in_flight_requests {}\n",
+             edgegate_in_flight_requests {}\n\
+             # HELP edgegate_request_duration_microseconds Request latency histogram in microseconds.\n\
+             # TYPE edgegate_request_duration_microseconds histogram\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"100\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"500\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"1000\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"5000\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"10000\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"50000\"}} {}\n\
+             edgegate_request_duration_microseconds_bucket{{le=\"+Inf\"}} {}\n\
+             edgegate_request_duration_microseconds_sum {}\n\
+             edgegate_request_duration_microseconds_count {}\n",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -279,14 +349,122 @@ impl Telemetry {
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
             s.retries_total,
-            s.in_flight_requests
+            s.in_flight_requests,
+            b100,
+            b500,
+            b1000,
+            b5000,
+            b10000,
+            b50000,
+            l_count,
+            l_sum,
+            l_count
         )
     }
 
-    /// Emits one structured JSON audit/request log line.
+    pub fn audit_entries(&self) -> Vec<AuditChainEntry> {
+        let guard = match self.audit_ledger.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.entries.iter().cloned().collect()
+    }
+
+    /// Verifies that every retained entry in the hash-chained audit ledger matches its recomputed
+    /// SHA-256 digest AND that each entry's `prev_hash` equals the preceding entry's `entry_hash`.
+    pub fn verify_audit_chain(&self) -> bool {
+        let guard = match self.audit_ledger.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.entries.is_empty() {
+            return guard.last_audit_hash == GENESIS_AUDIT_HASH;
+        }
+        let mut expected_prev: Option<&str> = None;
+        for entry in &guard.entries {
+            if entry.seq == 1 && entry.prev_hash != GENESIS_AUDIT_HASH {
+                return false;
+            }
+            if let Some(prev) = expected_prev {
+                if entry.prev_hash != prev {
+                    return false;
+                }
+            }
+            let recomputed = compute_audit_entry_hash(
+                &entry.prev_hash,
+                entry.seq,
+                entry.request_id,
+                &entry.trace_id,
+                &entry.org_id,
+                &entry.workload_id,
+                &entry.route,
+                &entry.decision,
+                entry.status,
+            );
+            if entry.entry_hash != recomputed {
+                return false;
+            }
+            expected_prev = Some(&entry.entry_hash);
+        }
+        guard
+            .entries
+            .back()
+            .is_some_and(|last| last.entry_hash == guard.last_audit_hash)
+    }
+
+    pub fn audit_to_json(&self) -> String {
+        let valid = self.verify_audit_chain();
+        let entries = self.audit_entries();
+        let mut items = Vec::with_capacity(entries.len());
+        for e in entries {
+            items.push(format!(
+                "{{\"seq\":{},\"request_id\":{},\"trace_id\":\"{}\",\"org_id\":\"{}\",\"workload_id\":\"{}\",\"route\":\"{}\",\"decision\":\"{}\",\"status\":{},\"prev_hash\":\"{}\",\"entry_hash\":\"{}\"}}",
+                e.seq,
+                e.request_id,
+                escape_json(&e.trace_id),
+                escape_json(&e.org_id),
+                escape_json(&e.workload_id),
+                escape_json(&e.route),
+                escape_json(&e.decision),
+                e.status,
+                escape_json(&e.prev_hash),
+                escape_json(&e.entry_hash)
+            ));
+        }
+        format!("{{\"valid\":{},\"entries\":[{}]}}", valid, items.join(","))
+    }
+
+    /// Emits one structured JSON audit/request log line, updates lock-free latency histograms,
+    /// and appends a SHA-256 hash-chained entry to the audit ledger.
     /// Strictly excludes request/response headers, bodies, and secret material.
     #[allow(clippy::too_many_arguments)]
     pub fn record_request(
+        &self,
+        request_id: u64,
+        trace_id: &str,
+        org_id: &str,
+        workload_id: &str,
+        route: &str,
+        upstream: &str,
+        decision: &str,
+        status: u16,
+        latency_us: u64,
+    ) {
+        self.record_request_with_trace(
+            request_id,
+            trace_id,
+            org_id,
+            workload_id,
+            route,
+            upstream,
+            decision,
+            status,
+            latency_us,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_request_with_trace(
         &self,
         request_id: u64,
         trace_id: &str,
@@ -316,6 +494,64 @@ impl Telemetry {
             }
         }
 
+        if latency_us <= 100 {
+            self.latency_le_100us.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_us <= 500 {
+            self.latency_le_500us.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_us <= 1_000 {
+            self.latency_le_1000us.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_us <= 5_000 {
+            self.latency_le_5000us.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_us <= 10_000 {
+            self.latency_le_10000us.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_us <= 50_000 {
+            self.latency_le_50000us.fetch_add(1, Ordering::Relaxed);
+        }
+        self.latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+
+        {
+            let mut guard = match self.audit_ledger.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let seq = guard.seq.saturating_add(1);
+            let prev_hash = guard.last_audit_hash.clone();
+            let entry_hash = compute_audit_entry_hash(
+                &prev_hash,
+                seq,
+                request_id,
+                trace_id,
+                org_id,
+                workload_id,
+                route,
+                decision,
+                status,
+            );
+            guard.seq = seq;
+            guard.last_audit_hash = entry_hash.clone();
+            if guard.entries.len() >= self.replay_capacity {
+                guard.entries.pop_front();
+            }
+            guard.entries.push_back(AuditChainEntry {
+                seq,
+                request_id,
+                trace_id: trace_id.to_string(),
+                org_id: org_id.to_string(),
+                workload_id: workload_id.to_string(),
+                route: route.to_string(),
+                decision: decision.to_string(),
+                status,
+                prev_hash,
+                entry_hash,
+            });
+        }
+
         info!(
             target: "edgegate::audit",
             request_id = request_id,
@@ -330,6 +566,26 @@ impl Telemetry {
             "edgegate_request"
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_audit_entry_hash(
+    prev_hash: &str,
+    seq: u64,
+    request_id: u64,
+    trace_id: &str,
+    org_id: &str,
+    workload_id: &str,
+    route: &str,
+    decision: &str,
+    status: u16,
+) -> String {
+    let payload = format!(
+        "{prev_hash}|{seq}|{request_id}|{trace_id}|{org_id}|{workload_id}|{route}|{decision}|{status}"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(payload.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn escape_json(s: &str) -> String {

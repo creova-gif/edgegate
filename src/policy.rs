@@ -8,7 +8,7 @@ use crate::config::CompiledPolicyRule;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
-    Allow,
+    Allow { max_body_bytes: Option<usize> },
     Deny { reason: String },
     RateLimited { reason: String },
 }
@@ -22,7 +22,7 @@ pub trait PolicyEngine: Send + Sync {
         method: &Method,
         path: &str,
     ) -> PolicyDecision {
-        self.evaluate_with_headers(identity, route_id, method, path, &HeaderMap::new())
+        self.evaluate_request(identity, route_id, method, path, None, &HeaderMap::new())
     }
 
     fn evaluate_with_headers(
@@ -31,6 +31,18 @@ pub trait PolicyEngine: Send + Sync {
         route_id: &str,
         method: &Method,
         path: &str,
+        headers: &HeaderMap,
+    ) -> PolicyDecision {
+        self.evaluate_request(identity, route_id, method, path, None, headers)
+    }
+
+    fn evaluate_request(
+        &self,
+        identity: &WorkloadIdentity,
+        route_id: &str,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
         headers: &HeaderMap,
     ) -> PolicyDecision;
 }
@@ -103,12 +115,13 @@ impl DefaultDenyPolicyEngine {
 }
 
 impl PolicyEngine for DefaultDenyPolicyEngine {
-    fn evaluate_with_headers(
+    fn evaluate_request(
         &self,
         identity: &WorkloadIdentity,
         route_id: &str,
         method: &Method,
         path: &str,
+        query: Option<&str>,
         headers: &HeaderMap,
     ) -> PolicyDecision {
         for entry in &self.entries {
@@ -142,6 +155,19 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
             }) {
                 continue;
             }
+            if let Some(q) = query {
+                if !rule.forbidden_query_params.is_empty() {
+                    let has_forbidden = q
+                        .split('&')
+                        .filter(|pair| !pair.is_empty())
+                        .filter_map(|pair| pair.split('=').next())
+                        .map(|k| k.trim().to_ascii_lowercase())
+                        .any(|k| rule.forbidden_query_params.contains(&k));
+                    if has_forbidden {
+                        continue;
+                    }
+                }
+            }
             if let Some(ref bucket) = entry.limiter {
                 if !bucket.try_acquire() {
                     return PolicyDecision::RateLimited {
@@ -152,7 +178,9 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
                     };
                 }
             }
-            return PolicyDecision::Allow;
+            return PolicyDecision::Allow {
+                max_body_bytes: rule.max_body_bytes,
+            };
         }
 
         PolicyDecision::Deny {
@@ -195,6 +223,8 @@ mod tests {
             methods,
             path_prefix: "/v1/github/repos".to_string(),
             required_headers: HashMap::new(),
+            forbidden_query_params: Vec::new(),
+            max_body_bytes: None,
             rate_limit_rps: None,
             rate_limit_burst: None,
         }])
@@ -210,7 +240,9 @@ mod tests {
         };
         assert_eq!(
             engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
-            PolicyDecision::Allow
+            PolicyDecision::Allow {
+                max_body_bytes: None
+            }
         );
     }
 
