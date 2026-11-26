@@ -44,6 +44,12 @@ pub struct ServerConfig {
     /// Bounded flight-recorder ring buffer capacity for failed/shadow-mismatched requests (`Milestone 3`).
     #[serde(default = "default_replay_buffer_size")]
     pub replay_buffer_size: usize,
+    /// Optional plaintext admin control-plane token (`Milestone 7`).
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// Optional pre-hashed SHA-256 admin control-plane token (64 hex chars, `Milestone 7`).
+    #[serde(default)]
+    pub admin_token_sha256: Option<String>,
     /// Optional inbound TLS (`rustls`) listener certificate/key configuration (`Milestone 5`).
     #[serde(default)]
     pub tls: Option<ServerTlsConfig>,
@@ -135,6 +141,9 @@ pub struct BackendConfig {
     pub id: String,
     /// Authority in `host:port` format.
     pub address: String,
+    /// Relative load-balancing weight (`Milestone 7`; default `1`, must be `> 0`).
+    #[serde(default = "default_backend_weight")]
+    pub weight: u32,
     /// Enable outbound TLS (`rustls`) to this backend.
     #[serde(default)]
     pub tls: bool,
@@ -192,6 +201,12 @@ pub struct PolicyRuleConfig {
     /// Optional required request headers (`header_name -> expected_value`) (`Milestone 6`).
     #[serde(default)]
     pub required_headers: HashMap<String, String>,
+    /// Optional forbidden query parameter keys blocked on this rule (`Milestone 7`).
+    #[serde(default)]
+    pub forbidden_query_params: Vec<String>,
+    /// Optional per-rule request body size limit in bytes (`Milestone 7`; must be `> 0` if `Some`).
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
     /// Optional token-bucket refill rate in requests per second (`Milestone 4`).
     #[serde(default)]
     pub rate_limit_rps: Option<u32>,
@@ -258,6 +273,10 @@ fn default_path_prefix() -> String {
     "/".to_string()
 }
 
+fn default_backend_weight() -> u32 {
+    1
+}
+
 /// Immutable, validated runtime snapshot stored in `ArcSwap<RuntimeSnapshot>`.
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
@@ -267,6 +286,7 @@ pub struct CompiledConfig {
     pub response_timeout: Duration,
     pub drain_timeout: Duration,
     pub replay_buffer_size: usize,
+    pub admin_token_digest: Option<[u8; 32]>,
     pub inbound_tls: Option<Arc<RustlsServerConfig>>,
     pub unix_listeners: Vec<CompiledUnixListener>,
     pub workloads: HashMap<[u8; 32], CompiledWorkload>,
@@ -317,6 +337,7 @@ pub struct CompiledBackend {
     pub host: String,
     pub port: u16,
     pub authority: String,
+    pub weight: u32,
     pub tls: bool,
     pub tls_sni: String,
     pub http2: bool,
@@ -350,6 +371,8 @@ pub struct CompiledPolicyRule {
     pub methods: HashSet<Method>,
     pub path_prefix: String,
     pub required_headers: HashMap<String, String>,
+    pub forbidden_query_params: Vec<String>,
+    pub max_body_bytes: Option<usize>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
 }
@@ -389,6 +412,26 @@ impl CompiledConfig {
                 "server timeouts must be > 0".to_string(),
             ));
         }
+
+        let admin_token_digest = match (raw.server.admin_token, raw.server.admin_token_sha256) {
+            (Some(plain), None) => {
+                if plain.trim().is_empty() {
+                    return Err(EdgeGateError::Config(
+                        "server.admin_token must be non-empty".to_string(),
+                    ));
+                }
+                Some(sha256_digest(plain.trim().as_bytes()))
+            }
+            (None, Some(hex_hash)) => Some(decode_sha256_hex(&hex_hash).map_err(|msg| {
+                EdgeGateError::Config(format!("invalid server.admin_token_sha256: {msg}"))
+            })?),
+            (Some(_), Some(_)) => {
+                return Err(EdgeGateError::Config(
+                    "server cannot set both admin_token and admin_token_sha256".to_string(),
+                ));
+            }
+            (None, None) => None,
+        };
 
         let inbound_tls = match raw.server.tls {
             Some(ref tls_cfg) => Some(compile_server_tls(tls_cfg)?),
@@ -553,6 +596,12 @@ impl CompiledConfig {
                         p.name, b.id
                     )));
                 }
+                if b.weight == 0 {
+                    return Err(EdgeGateError::Config(format!(
+                        "pool '{}' backend '{}' weight must be > 0",
+                        p.name, b.id
+                    )));
+                }
                 let (host, port) = parse_authority(&b.address).map_err(|msg| {
                     EdgeGateError::Config(format!(
                         "pool '{}' backend '{}' invalid address '{}': {msg}",
@@ -571,6 +620,7 @@ impl CompiledConfig {
                     host,
                     port,
                     authority: b.address,
+                    weight: b.weight,
                     tls: b.tls,
                     tls_sni,
                     http2: b.http2,
@@ -709,6 +759,23 @@ impl CompiledConfig {
                     pol.route_id
                 )));
             }
+            if pol.max_body_bytes == Some(0) {
+                return Err(EdgeGateError::Config(format!(
+                    "policy for route '{}' max_body_bytes must be > 0",
+                    pol.route_id
+                )));
+            }
+            let mut forbidden_query_params = Vec::with_capacity(pol.forbidden_query_params.len());
+            for param in pol.forbidden_query_params {
+                let lower_param = param.trim().to_ascii_lowercase();
+                if lower_param.is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "policy for route '{}' has empty forbidden_query_params entry",
+                        pol.route_id
+                    )));
+                }
+                forbidden_query_params.push(lower_param);
+            }
             let mut methods = HashSet::with_capacity(pol.methods.len());
             for m in pol.methods {
                 let parsed =
@@ -742,6 +809,8 @@ impl CompiledConfig {
                 methods,
                 path_prefix: pol.path_prefix,
                 required_headers,
+                forbidden_query_params,
+                max_body_bytes: pol.max_body_bytes,
                 rate_limit_rps: pol.rate_limit_rps,
                 rate_limit_burst: pol.rate_limit_burst,
             });
@@ -791,6 +860,7 @@ impl CompiledConfig {
             response_timeout: Duration::from_millis(raw.server.response_timeout_ms),
             drain_timeout: Duration::from_millis(raw.server.drain_timeout_ms),
             replay_buffer_size: raw.server.replay_buffer_size.max(1),
+            admin_token_digest,
             inbound_tls,
             unix_listeners,
             workloads,

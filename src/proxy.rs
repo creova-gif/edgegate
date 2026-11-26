@@ -16,10 +16,13 @@ use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{error, info, warn};
 
+use serde::Deserialize;
+use subtle::ConstantTimeEq;
+
 use crate::auth::{
     HeaderTokenAuthenticator, TransportBoundAuthenticator, WorkloadAuthenticator, WorkloadIdentity,
 };
-use crate::config::{CompiledConfig, CompiledWorkload};
+use crate::config::{sha256_digest, CompiledConfig, CompiledWorkload};
 use crate::lb::{LoadBalancer, PoolLoadBalancer};
 use crate::policy::{DefaultDenyPolicyEngine, PolicyDecision, PolicyEngine};
 use crate::pool::ConnectionPool;
@@ -35,6 +38,18 @@ pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// Optional routing-key header for `ConsistentHash` load balancing (`Milestone 3`).
 pub const ROUTING_KEY_HEADER: &str = "x-edgegate-routing-key";
+
+/// Locked admin control-plane authentication header (`Milestone 7`).
+pub const ADMIN_TOKEN_HEADER: &str = "x-edgegate-admin-token";
+
+#[derive(Debug, Deserialize)]
+struct RotateSecretRequest {
+    org_id: String,
+    credential_ref: String,
+    value: String,
+    #[serde(default)]
+    expires_at_epoch_s: Option<u64>,
+}
 
 /// RAII handle returned by `EdgeGateProxy::register_boxlet_sandbox`.
 /// Automatically stops the sandbox UDS listener and removes the socket file when dropped.
@@ -423,9 +438,103 @@ impl EdgeGateProxy {
             return resp;
         }
 
+        let snap = self.runtime.load_full();
+
+        // Step 0b: Authenticated Admin Control Plane (`Milestone 7`).
+        if path == "/_edgegate/admin/audit"
+            || path == "/_edgegate/admin/reload"
+            || path == "/_edgegate/admin/secrets/rotate"
+        {
+            if let Err(err) = verify_admin_token(&snap, req.headers()) {
+                return json_error_response(err.status_code(), &err.public_message());
+            }
+            if path == "/_edgegate/admin/audit" && req.method() == Method::GET {
+                let body = Bytes::from(self.telemetry.audit_to_json());
+                let mut resp =
+                    Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                return resp;
+            }
+            if path == "/_edgegate/admin/reload" && req.method() == Method::POST {
+                let max_body = snap.config.max_request_body_bytes;
+                let Ok(collected) = Limited::new(req.into_body(), max_body).collect().await else {
+                    return json_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "admin request body exceeds limit",
+                    );
+                };
+                let body_bytes = collected.to_bytes();
+                let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "admin reload body must be valid UTF-8 TOML",
+                    );
+                };
+                match self.reload_from_toml_str(body_str) {
+                    Ok(gen) => {
+                        let body = Bytes::from(format!(
+                            "{{\"status\":\"reloaded\",\"config_generation\":{gen}}}"
+                        ));
+                        let mut resp =
+                            Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut()
+                            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        return resp;
+                    }
+                    Err(err) => {
+                        return json_error_response(StatusCode::BAD_REQUEST, &err.to_string());
+                    }
+                }
+            }
+            if path == "/_edgegate/admin/secrets/rotate" && req.method() == Method::POST {
+                let max_body = snap.config.max_request_body_bytes;
+                let Ok(collected) = Limited::new(req.into_body(), max_body).collect().await else {
+                    return json_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "admin request body exceeds limit",
+                    );
+                };
+                let body_bytes = collected.to_bytes();
+                let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "admin secret rotation body must be valid UTF-8",
+                    );
+                };
+                let Ok(rot_req) = parse_rotate_secret_request(body_str) else {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid secret rotation payload",
+                    );
+                };
+                if rot_req.org_id.trim().is_empty() || rot_req.credential_ref.trim().is_empty() {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "org_id and credential_ref must be non-empty",
+                    );
+                }
+                self.rotate_secret(
+                    &rot_req.org_id,
+                    &rot_req.credential_ref,
+                    rot_req.value,
+                    rot_req.expires_at_epoch_s,
+                );
+                let body = Bytes::from_static(b"{\"status\":\"rotated\"}");
+                let mut resp =
+                    Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                return resp;
+            }
+            return json_error_response(StatusCode::BAD_REQUEST, "unsupported admin method");
+        }
+
         let req_id = self.telemetry.next_request_id();
         let (traceparent, trace_id) = resolve_or_generate_traceparent(req.headers(), req_id);
-        let snap = self.runtime.load_full();
 
         let method = req.method().clone();
         let path = path.to_string();
@@ -486,12 +595,16 @@ impl EdgeGateProxy {
             }
         };
 
-        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/headers policy + rate limit.
-        match snap
-            .policy
-            .evaluate_with_headers(&identity, &route.id, &method, &path, req.headers())
-        {
-            PolicyDecision::Allow => {}
+        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/query/headers policy + rate limit.
+        let rule_max_body_bytes = match snap.policy.evaluate_request(
+            &identity,
+            &route.id,
+            &method,
+            &path,
+            query.as_deref(),
+            req.headers(),
+        ) {
+            PolicyDecision::Allow { max_body_bytes } => max_body_bytes,
             PolicyDecision::Deny { reason } => {
                 return self.finish_error(
                     req_id,
@@ -535,7 +648,7 @@ impl EdgeGateProxy {
                     .insert(RETRY_AFTER, HeaderValue::from_static("1"));
                 return resp;
             }
-        }
+        };
 
         // Step 5: Select healthy backend via LoadBalancer (supports ConsistentHash routing key).
         let effective_key = routing_key.as_deref().unwrap_or(&identity.workload_id);
@@ -643,7 +756,7 @@ impl EdgeGateProxy {
             }
         }
 
-        let max_body = snap.config.max_request_body_bytes;
+        let max_body = rule_max_body_bytes.unwrap_or(snap.config.max_request_body_bytes);
         let collected = match Limited::new(req.into_body(), max_body).collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => {
@@ -1075,6 +1188,46 @@ impl EdgeGateProxy {
         }
         resp
     }
+}
+
+fn verify_admin_token(snap: &RuntimeSnapshot, headers: &HeaderMap) -> Result<(), EdgeGateError> {
+    let expected = snap.config.admin_token_digest.ok_or_else(|| {
+        EdgeGateError::Unauthorized("admin control plane token not configured".to_string())
+    })?;
+    let header_val = headers
+        .get(ADMIN_TOKEN_HEADER)
+        .ok_or_else(|| EdgeGateError::Unauthorized("missing X-EdgeGate-Admin-Token".to_string()))?;
+    let raw_token = header_val
+        .to_str()
+        .map_err(|_| EdgeGateError::Unauthorized("non-ASCII X-EdgeGate-Admin-Token".to_string()))?
+        .trim();
+    if raw_token.is_empty() {
+        return Err(EdgeGateError::Unauthorized(
+            "empty X-EdgeGate-Admin-Token".to_string(),
+        ));
+    }
+    let candidate = sha256_digest(raw_token.as_bytes());
+    if bool::from(expected.ct_eq(&candidate)) {
+        Ok(())
+    } else {
+        Err(EdgeGateError::Unauthorized(
+            "invalid X-EdgeGate-Admin-Token".to_string(),
+        ))
+    }
+}
+
+fn parse_rotate_secret_request(body_str: &str) -> Result<RotateSecretRequest, String> {
+    if let Ok(req) = toml::from_str::<RotateSecretRequest>(body_str) {
+        return Ok(req);
+    }
+    let normalized = body_str.replace("\":", "\" =");
+    #[derive(Deserialize)]
+    struct WrappedRotate {
+        req: RotateSecretRequest,
+    }
+    toml::from_str::<WrappedRotate>(&format!("req = {normalized}"))
+        .map(|w| w.req)
+        .map_err(|e| e.to_string())
 }
 
 fn json_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {

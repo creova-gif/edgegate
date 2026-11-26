@@ -26,8 +26,10 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                              EdgeGate L7 Data Plane                              ║
 ║                                                                                  ║
-║  [Step 0] Built-in Observability (`/_edgegate/healthz`, `/metrics`, `/replay`)   ║
-║     │                                                                            ║
+║  [Step 0] Observability (`/_edgegate/healthz`, `/metrics`, `/replay`) &          ║
+║     │     Authenticated Admin Control Plane (`/_edgegate/admin/{reload,          ║
+║     │     secrets/rotate,audit}`, constant-time `X-EdgeGate-Admin-Token`,        ║
+║     │     disabled fail-closed when `admin_token` is unconfigured)               ║
 ║     ▼                                                                            ║
 ║  [Step 1] Fail-Closed Path Normalization Guard (`validate_request_path`)         ║
 ║     │     Rejects `..`, `%2e`, `%2f`, `%5c`, `\`, `%00`, `//`, control chars     ║
@@ -39,15 +41,16 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║  [Step 3] Deterministic Longest-Prefix & Host Router (`Router::match_route`)     ║
 ║     │                                                                            ║
 ║     ▼                                                                            ║
-║  [Step 4] Default-Deny Multi-Tenant RBAC & Attribute Policy (`PolicyEngine`)     ║
+║  [Step 4] Default-Deny Multi-Tenant RBAC, Attribute & Query Policy (`INV-15/17`) ║
 ║     │     Enforces `(org_id, workload_id, required_roles, route_id, method, pfx, ║
-║     │     required_headers)` for fine-grained L7 & MCP tool-call governance      ║
+║     │     required_headers, forbidden_query_params)` and resolves per-rule       ║
+║     │     `max_body_bytes` ceiling (`403 Forbidden` on policy/query violation)   ║
 ║     ▼                                                                            ║
 ║  [Step 5] Per-Workload Token-Bucket Rate Limiter (`TokenBucketRateLimiter`)      ║
 ║     │     Enforces `rate_limit_rps` & `rate_limit_burst` (`429 Too Many Reqs`)   ║
 ║     ▼                                                                            ║
-║  [Step 6] Load Balancer & 3-State Circuit Breaker (`PoolLoadBalancer`)           ║
-║     │     `RoundRobin` | `LeastConnections` | `ConsistentHash` | `LatencyAware`  ║
+║  [Step 6] Weighted Load Balancer & 3-State Circuit Breaker (`PoolLoadBalancer`)  ║
+║     │     Weighted `RoundRobin` | `LeastConnections` | `ConsistentHash` | `EWMA` ║
 ║     │     Acquires RAII `BackendLease` (`Closed` / `Open` / `HalfOpen` probe)    ║
 ║     ▼                                                                            ║
 ║  [Step 7] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
@@ -56,7 +59,7 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     expiry) and injects W3C `traceparent` + `(org_id, credential_ref)`     ║
 ║     ▼                                                                            ║
 ║  [Step 8] Bounded Body Collection (`http_body_util::Limited`, `413` on overflow) ║
-║     │                                                                            ║
+║     │     Enforces `min(server.max_request_body_bytes, policy.max_body_bytes)`   ║
 ║     ▼                                                                            ║
 ║  [Step 9] Bounded Connection Pool + SSRF Defense + Idempotent Failover           ║
 ║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
@@ -64,9 +67,11 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     • Controlled failover (`max_idempotent_retries`) for `GET`/`HEAD`/     ║
 ║     │       `OPTIONS` only; never follows `3xx` or retries state-mutating verbs  ║
 ║     ▼                                                                            ║
-║  [Step 10] Defense-in-Depth Response Credential Reflection Guard                 ║
+║  [Step 10] Defense-in-Depth Response Credential Reflection Guard & Audit Chain   ║
 ║           • When `block_secret_reflection = true`, inspects upstream response    ║
 ║             headers and body; blocks leaked secrets with `502 Bad Gateway`       ║
+║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->             ║
+║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram    ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
                     │ Primary Dispatch                         │ Async Non-Blocking Clone
                     ▼                                          ▼
@@ -171,13 +176,15 @@ Every backend maintains an independent state machine (`CircuitState`) alongside 
 3. **Controlled Idempotent Failover Retries (`max_idempotent_retries`):**
    Pools may configure `max_idempotent_retries` (default `0`). When an upstream attempt fails with a connect or transport error (`EdgeGateError::UpstreamConnect` / `EdgeGateError::UpstreamTimeout`), EdgeGate records the failure on the failed backend and—**only if the HTTP method is safe/idempotent (`GET`, `HEAD`, `OPTIONS`)**—selects the next healthy backend in the pool, increments `retries_total`, and re-dispatches the request. State-mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) are **never** retried to prevent duplicate side effects.
 
-### Four Load-Balancing Strategies (`LbStrategyConfig`)
+### Four Load-Balancing Strategies (`LbStrategyConfig`) & Weighted Canary Splitting (`weight`)
+
+Each `[[pools.backends]]` entry accepts an optional `weight` (default `1`, must be `> 0`) for proportional canary traffic splitting across healthy backends:
 
 | Strategy | Configuration Value | Selection Mechanics & Complexity |
 |---|---|---|
-| **Round Robin** | `"round_robin"` | Lock-free `AtomicUsize::fetch_add(1, Relaxed)` cursor scanning up to `N` backends for the first admissible candidate. |
+| **Round Robin (Weighted)** | `"round_robin"` | Lock-free `AtomicUsize::fetch_add(1, Relaxed)` cursor stepping through a weight-expanded schedule (`weight` slots per backend) and falling back across healthy candidates if the selected slot's circuit is open. |
 | **Least Connections** | `"least_connections"` | Tracks active requests per backend via an `Arc<AtomicUsize>` incremented on `select` and decremented in `BackendLease::drop`. Scans from a rotating cursor to break ties fairly and releases any speculatively claimed `HalfOpen` probe if a strictly less-loaded backend is found. |
-| **Consistent Hash** | `"consistent_hash"` | Computes a deterministic 64-bit FNV-1a hash (`fnv1a_64`) over the `X-EdgeGate-Routing-Key` request header (falling back to the authenticated `workload_id`) modulo pool size, probing linearly to the next healthy backend if the primary shard's circuit is open. |
+| **Consistent Hash (Weighted)** | `"consistent_hash"` | Computes a deterministic 64-bit FNV-1a hash (`fnv1a_64`) over the `X-EdgeGate-Routing-Key` request header (falling back to the authenticated `workload_id`) modulo the weight-expanded ring, probing linearly to the next healthy backend if the primary shard's circuit is open. |
 | **Latency-Aware (EWMA)** | `"latency_aware"` | Maintains a lock-free `AtomicU64` Exponentially Weighted Moving Average of upstream response latency in microseconds ($\text{EWMA}_{t} = \frac{3 \cdot \text{EWMA}_{t-1} + L_t}{4}$, $\alpha = 0.25$) updated on every successful response, selecting the admissible backend with the lowest EWMA latency. |
 
 ---
@@ -294,3 +301,29 @@ Policy rules (`[[policies]]`) support an optional `required_headers: HashMap<Str
 
 ### Zero-Downtime Dual Workload Token Rollover (`secondary_token` / `secondary_token_sha256`)
 Each `[[workloads]]` entry supports an optional `secondary_token` (or pre-hashed `secondary_token_sha256`) alongside the primary `token` / `token_sha256`. Both SHA-256 digests are registered in the compiled workload lookup table and verified using constant-time comparison (`subtle::ConstantTimeEq`), allowing orchestrators to roll workload bearer tokens with zero dropped requests during the rotation window.
+
+---
+
+## 11. Authenticated Admin Control Plane, Tamper-Evident Audit Ledger, Per-Rule Query/Body Limits & Prometheus Histograms (`Milestone 7` / `v0.7.0`)
+
+### Authenticated Admin Control Plane API (`/_edgegate/admin/*`)
+EdgeGate exposes an explicit control-plane HTTP API gated by `X-EdgeGate-Admin-Token` (`server.admin_token` or pre-hashed 64-hex-char `server.admin_token_sha256`):
+1. **Fail-Closed When Unconfigured:** If neither `server.admin_token` nor `server.admin_token_sha256` is configured in `[server]`, all requests to `/_edgegate/admin/*` are rejected fail-closed (`403 Forbidden`) so control-plane mutations can never be accidentally exposed on a default listener.
+2. **Constant-Time Verification:** Incoming `X-EdgeGate-Admin-Token` values are hashed with SHA-256 and compared against the compiled admin token digest using `subtle::ConstantTimeEq` (`401 Unauthorized` on missing/invalid token).
+3. **Control-Plane Operations:**
+   - `POST /_edgegate/admin/reload`: Atomically compiles and swaps a new configuration snapshot via `ArcSwap` without dropping in-flight connections.
+   - `POST /_edgegate/admin/secrets/rotate`: Rotates a scoped `(org_id, credential_ref)` secret and optional `expires_at_epoch_s` TTL live in-memory (`secret_rotations_total`) with automatic zeroization of the superseded `SecretValue`.
+   - `GET /_edgegate/admin/audit`: Returns the bounded SHA-256 hash-chained audit ledger (`records`, `chain_valid`, `head_hash`) after verifying the cryptographic hash chain from genesis.
+
+### Cryptographic SHA-256 Hash-Chained Tamper-Evident Audit Ledger (`INV-16`)
+Every gateway decision (`ALLOWED`, `BLOCKED`, `RATE_LIMITED`, `ERROR`) is appended to an in-memory tamper-evident audit ledger:
+- Each `AuditLedgerEntry` computes `entry_hash = SHA-256(prev_hash | request_id | trace_id | org_id | workload_id | route | upstream | decision | status | latency_us)`, linking every decision to its predecessor (`prev_hash`).
+- Operators can inspect and cryptographically verify the chain at `GET /_edgegate/admin/audit` and monitor continuous integrity via `audit_chain_valid` in `GET /_edgegate/metrics` (`edgegate_audit_chain_valid` in Prometheus format).
+
+### Per-Rule Query-Parameter & Payload Resource Limits (`INV-17`, `forbidden_query_params`, `max_body_bytes`)
+Policy rules (`[[policies]]`) support granular L7 query and payload resource controls:
+- **`forbidden_query_params`:** Lists query parameter names (normalized case-insensitively at compile time) that are forbidden on matching requests. If a request URI query string contains any forbidden parameter name (including percent-encoded variants), `DefaultDenyPolicyEngine` rejects the request with `403 Forbidden` before upstream dispatch.
+- **`max_body_bytes`:** Overrides or tightens the request payload size ceiling for a specific policy rule (`effective_limit = rule.max_body_bytes.unwrap_or(server.max_request_body_bytes)`). Payloads exceeding the matched rule's `max_body_bytes` are aborted via `http_body_util::Limited` with `413 Payload Too Large`.
+
+### Lock-Free Prometheus Latency Histograms (`edgegate_request_duration_microseconds_bucket`)
+`Telemetry` tracks end-to-end request duration in lock-free `AtomicU64` cumulative microsecond buckets (`le="100"`, `le="500"`, `le="1000"`, `le="5000"`, `le="10000"`, `le="50000"`, `le="+Inf"`), plus `_sum` and `_count`, exported at `GET /_edgegate/metrics?format=prometheus` (`edgegate_request_duration_microseconds_bucket`).

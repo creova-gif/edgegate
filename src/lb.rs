@@ -181,6 +181,7 @@ struct PoolState {
     passive_failure_threshold: u32,
     passive_cooldown: Duration,
     rr_cursor: AtomicUsize,
+    weighted_schedule: Vec<usize>,
     backends: Vec<BackendState>,
 }
 
@@ -195,6 +196,13 @@ impl PoolLoadBalancer {
     pub fn from_pools(compiled: &HashMap<String, CompiledPool>) -> Self {
         let mut pools = HashMap::with_capacity(compiled.len());
         for (name, pool) in compiled {
+            let mut weighted_schedule = Vec::new();
+            for (idx, b) in pool.backends.iter().enumerate() {
+                let reps = b.weight.clamp(1, 100) as usize;
+                for _ in 0..reps {
+                    weighted_schedule.push(idx);
+                }
+            }
             let backends = pool
                 .backends
                 .iter()
@@ -217,6 +225,7 @@ impl PoolLoadBalancer {
                     passive_failure_threshold: pool.passive_failure_threshold,
                     passive_cooldown: pool.passive_cooldown,
                     rr_cursor: AtomicUsize::new(0),
+                    weighted_schedule,
                     backends,
                 },
             );
@@ -244,9 +253,11 @@ impl LoadBalancer for PoolLoadBalancer {
 
         let selected: Option<(&BackendState, bool)> = match pool.strategy {
             LbStrategyConfig::RoundRobin => {
+                let sched_len = pool.weighted_schedule.len().max(1);
                 let start = pool.rr_cursor.fetch_add(1, Ordering::Relaxed);
-                (0..len).find_map(|offset| {
-                    let b = &pool.backends[(start + offset) % len];
+                (0..sched_len).find_map(|offset| {
+                    let idx = pool.weighted_schedule[(start + offset) % sched_len];
+                    let b = &pool.backends[idx];
                     b.try_admit(now).map(|is_probe| (b, is_probe))
                 })
             }
@@ -401,6 +412,7 @@ mod tests {
                         host: "127.0.0.1".to_string(),
                         port: 9001,
                         authority: "127.0.0.1:9001".to_string(),
+                        weight: 1,
                         tls: false,
                         tls_sni: "127.0.0.1".to_string(),
                         http2: false,
@@ -410,6 +422,7 @@ mod tests {
                         host: "127.0.0.1".to_string(),
                         port: 9002,
                         authority: "127.0.0.1:9002".to_string(),
+                        weight: 1,
                         tls: false,
                         tls_sni: "127.0.0.1".to_string(),
                         http2: false,
