@@ -1,12 +1,12 @@
-# EdgeGate Threat Model (Milestones 1–5 / `v0.5.0`)
+# EdgeGate Threat Model (Milestones 1–6 / `v0.6.0`)
 
 ## 1. Security Objective
 Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxlet microVMs/containers) to call explicitly authorized HTTP/1.1, HTTP/2, and HTTPS upstream services without possessing the underlying upstream API credentials or unrestricted outbound network authority.
 
 ## 2. Assets
-- **Upstream API credentials:** Scoped secrets held inside EdgeGate (`SecretProvider`, backed by process environment or config), injected only into authorized outbound requests, and optionally guarded against upstream response reflection (`block_secret_reflection = true`).
-- **Tenant, role, & organizational boundaries (`org_id`, `roles`):** Strict isolation ensuring a workload in `org_a` cannot access routes, roles, credentials, or pooled response streams belonging to `org_b`.
-- **Workload identity (`X-EdgeGate-Token` or zero-token Unix Domain Socket / Boxlet guard):** Scoped gateway identity tokens (over TCP or inbound TLS 1.2/1.3 `[server.tls]`, never forwarded upstream) or host-mounted static/dynamic UDS listeners where identity comes from the socket boundary itself.
+- **Upstream API credentials:** Scoped secrets held inside EdgeGate (`SecretProvider`, backed by process environment or config, with optional `expires_at_epoch_s` TTL enforcement and live in-memory rotation via `EdgeGateProxy::rotate_secret`), injected only into authorized outbound requests, and optionally guarded against upstream response reflection (`block_secret_reflection = true`).
+- **Tenant, role, & organizational boundaries (`org_id`, `roles`, `required_headers`):** Strict isolation ensuring a workload in `org_a` cannot access routes, roles, L7/MCP tool attributes, credentials, or pooled response streams belonging to `org_b`.
+- **Workload identity (`X-EdgeGate-Token` primary/secondary rollover or zero-token Unix Domain Socket / Boxlet guard):** Scoped gateway identity tokens (over TCP or inbound TLS 1.2/1.3 `[server.tls]`, supporting zero-downtime `secondary_token` / `secondary_token_sha256` rotation, never forwarded upstream) or host-mounted static/dynamic UDS listeners where identity comes from the socket boundary itself.
 - **Audit logs & flight-recorder replay buffer:** Structured JSON records of allow/deny decisions and sanitized failure, secret-reflection, and shadow-mismatch entries (`/_edgegate/replay`) that never contain raw credentials, headers, or request bodies.
 
 ## 3. Trust Boundaries
@@ -17,10 +17,10 @@ Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxle
               │  HTTP/1.1 or HTTP/2 over UDS (zero tokens) OR TCP / Inbound TLS + X-EdgeGate-Token
               ▼
    ╔═════════════════════════╗
-   ║     EdgeGate Gateway    ║  <-- Enforces parse, path validation, auth/UDS identity,
-   ║   (trusted choke point) ║      RBAC policy, rate limits, 3-state circuit breaker,
+   ║     EdgeGate Gateway    ║  <-- Enforces parse, path validation, dual-token/UDS identity,
+   ║   (trusted choke point) ║      RBAC & required_headers policy, rate limits, 3-state breaker,
    ╚═════════════════════════╝      idempotent-only failover, SSRF guard, header strip,
-              │                     credential injection, no-redirect, reflection guard
+              │                     TTL-checked credential injection, no-redirect, reflection guard
               ├──► Primary Upstream Pool (HTTP/1.1, HTTP/2 h2c/ALPN, rustls HTTPS)
               └──► Optional Shadow Pool  (async non-blocking mirror + status diff)
 ```
@@ -33,7 +33,7 @@ Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxle
 | **Credential leakage via env/fs** | **INV-03 / INV-05** | Prompt injection or RCE reads environment variables or disk inside sandbox. | Sandbox holds zero upstream API keys (and zero tokens of any kind when connected via static `server.unix_listeners` or dynamic `register_boxlet_sandbox`); EdgeGate injects scoped credentials on the wire after policy authorization. |
 | **Path-traversal policy bypass** | **INV-01** | Client sends `/v1/allowed/../secret`, `/%2e%2e/`, backslashes `\`, `%00`, or `//` to evade `path_prefix` rules. | Fail-closed pre-policy path validator (`src/router.rs`) rejects raw/encoded dot-segments, backslashes, null bytes, and double slashes with `400 Bad Request`. |
 | **Cross-tenant (`org_id`) & RBAC escalation** | **INV-04 / INV-05** | Workload from `org_a` calls a route belonging to `org_b`, or lacks `required_roles`. | Default-deny `PolicyEngine` (`src/policy.rs`) binds every rule and `SecretProvider` lookup to the authenticated `org_id`, `workload_id`, and `required_roles`. |
-| **Timing side-channel on auth** | **INV-02** | Attacker probes `X-EdgeGate-Token` character-by-character. | Pre-hashed SHA-256 token digests verified with `subtle::ConstantTimeEq` (`src/auth.rs`). |
+| **Timing side-channel & token rotation outage** | **INV-02** | Attacker probes `X-EdgeGate-Token` character-by-character, or rotating a workload token breaks active sandboxes. | Pre-hashed SHA-256 primary and secondary (`secondary_token` / `secondary_token_sha256`) token digests verified with `subtle::ConstantTimeEq` (`src/auth.rs`). |
 | **Auth/hop-by-hop header smuggling** | **INV-06** | Client supplies forged `Authorization`/`X-Api-Key`, `Proxy-Authorization`, or `Connection`-listed headers. | Unconditionally strips `X-EdgeGate-Token`, `Proxy-Authorization`, RFC 9110 hop-by-hop headers (plus `Connection`-listed names), and the route's target credential header before injection; rewrites `Host` to backend authority. |
 | **Redirect credential leak & SSRF** | **INV-08** | Authorized upstream returns `302 Location: http://attacker/` or `http://169.254.169.254/`. | EdgeGate never automatically follows `3xx` redirects; the `3xx` is returned directly to the caller with zero credential re-injection. |
 | **DNS rebinding & metadata SSRF** | **INV-07** | Backend hostname resolves to loopback, RFC1918, cloud metadata (`169.254.169.254`), IPv6 ULA/link-local, or IPv4-mapped IPv6 (`::ffff:169.254.169.254`). | Resolve-validate-connect (`src/pool.rs`): resolves via `tokio::net::lookup_host`, checks every IPv4/IPv6/unwrapped IPv4-mapped IPv6 address against the blocklist (unless `allow_private_ip = true` is explicitly configured for local fixtures), and dials the validated `SocketAddr` directly. |
@@ -43,6 +43,8 @@ Allow untrusted workloads (AI agents, sandboxed code, isolated containers, Boxle
 | **Log & flight-recorder secret leakage** | **INV-11** | Raw credentials printed via `Debug`, `Display`, structured logs, or `/_edgegate/replay`. | `SecretValue` wraps bytes in `ZeroizeOnDrop` with redacted `Debug` (`"[REDACTED]"`). Structured JSON logs and `ReplayRecord` store only sanitized routing/status metadata. |
 | **Upstream response credential reflection** | **INV-12** | Misconfigured debug endpoint or compromised upstream reflects injected secret in response headers or body. | Response Credential Reflection Guard (`block_secret_reflection = true` on `[routes.credential]`): scans upstream response headers and buffered body for the raw secret bytes, blocking the response with `502 Bad Gateway`, incrementing `secret_reflections_blocked_total`, and recording a sanitized `secret_reflection_blocked` audit entry in `/_edgegate/replay`. |
 | **Non-idempotent retry side-effect duplication** | **INV-13** | Upstream transport error during `POST`/`DELETE` triggers automatic failover retry, duplicating state mutations. | Idempotent-Only Retry Safety (`max_idempotent_retries` on `[[pools]]`): retries connect/transport errors exclusively for safe methods (`GET`, `HEAD`, `OPTIONS`) against the next healthy backend (`retries_total`) and never retries `POST`, `PUT`, `PATCH`, or `DELETE`. |
+| **Stale / expired upstream credential usage** | **INV-14** | Long-lived or expired upstream credential continues to be injected into outbound requests, or rotating a credential requires proxy downtime. | Scoped Credential Rotation & TTL Expiry (`expires_at_epoch_s` on `[[secrets]]`, `EdgeGateProxy::rotate_secret`): fails closed (`403 Forbidden`) when `now >= expires_at_epoch_s` and supports live in-memory secret rotation (`secret_rotations_total`) with immediate zeroization of superseded secrets. |
+| **Unauthorized MCP tool or L7 action invocation** | **INV-15** | Compromised agent authorized for an upstream route invokes a destructive MCP tool or unapproved L7 action on that route. | Programmable Request-Attribute Policy Matching (`required_headers` on `[[policies]]`, e.g., `required_headers = { "x-mcp-tool" = "github.read_repo" }`): enforces fine-grained L7 header/attribute predicates alongside Keelway MCP Gateway and IoRa, rejecting unauthorized tool calls with `403 Forbidden`. |
 
 ## 5. Explicit Non-Goals & Residual Risks
 - **Obfuscated/encoded upstream credential reflection:** While `block_secret_reflection = true` (`INV-12`) blocks verbatim reflection of injected credentials in response headers and bodies (`502 Bad Gateway`), byte-pattern scrubbing cannot detect secrets that a malicious upstream deliberately base64-encodes, compresses, or encrypts inside a response payload.

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use http::Method;
+use http::{HeaderMap, Method};
 
 use crate::auth::WorkloadIdentity;
 use crate::config::CompiledPolicyRule;
@@ -21,6 +21,17 @@ pub trait PolicyEngine: Send + Sync {
         route_id: &str,
         method: &Method,
         path: &str,
+    ) -> PolicyDecision {
+        self.evaluate_with_headers(identity, route_id, method, path, &HeaderMap::new())
+    }
+
+    fn evaluate_with_headers(
+        &self,
+        identity: &WorkloadIdentity,
+        route_id: &str,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
     ) -> PolicyDecision;
 }
 
@@ -92,12 +103,13 @@ impl DefaultDenyPolicyEngine {
 }
 
 impl PolicyEngine for DefaultDenyPolicyEngine {
-    fn evaluate(
+    fn evaluate_with_headers(
         &self,
         identity: &WorkloadIdentity,
         route_id: &str,
         method: &Method,
         path: &str,
+        headers: &HeaderMap,
     ) -> PolicyDecision {
         for entry in &self.entries {
             let rule = &entry.rule;
@@ -122,19 +134,25 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
             if !rule.methods.contains(method) {
                 continue;
             }
-            if path_matches_prefix(path, &rule.path_prefix) {
-                if let Some(ref bucket) = entry.limiter {
-                    if !bucket.try_acquire() {
-                        return PolicyDecision::RateLimited {
-                            reason: format!(
-                                "rate-limited: org '{}' workload '{}' exceeded token bucket on route '{}'",
-                                identity.org_id, identity.workload_id, route_id
-                            ),
-                        };
-                    }
-                }
-                return PolicyDecision::Allow;
+            if !path_matches_prefix(path, &rule.path_prefix) {
+                continue;
             }
+            if !rule.required_headers.iter().all(|(k, expected_v)| {
+                headers.get(k.as_str()).and_then(|v| v.to_str().ok()) == Some(expected_v.as_str())
+            }) {
+                continue;
+            }
+            if let Some(ref bucket) = entry.limiter {
+                if !bucket.try_acquire() {
+                    return PolicyDecision::RateLimited {
+                        reason: format!(
+                            "rate-limited: org '{}' workload '{}' exceeded token bucket on route '{}'",
+                            identity.org_id, identity.workload_id, route_id
+                        ),
+                    };
+                }
+            }
+            return PolicyDecision::Allow;
         }
 
         PolicyDecision::Deny {
@@ -162,7 +180,7 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
@@ -176,6 +194,7 @@ mod tests {
             route_id: "github".to_string(),
             methods,
             path_prefix: "/v1/github/repos".to_string(),
+            required_headers: HashMap::new(),
             rate_limit_rps: None,
             rate_limit_burst: None,
         }])
