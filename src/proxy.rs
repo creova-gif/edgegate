@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http::header::{HeaderValue, CONTENT_TYPE, HOST};
+use http::header::{HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, HOST, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
@@ -24,7 +24,8 @@ use crate::lb::{LoadBalancer, PoolLoadBalancer};
 use crate::policy::{DefaultDenyPolicyEngine, PolicyDecision, PolicyEngine};
 use crate::pool::ConnectionPool;
 use crate::router::{
-    rewrite_upstream_path_and_query, sanitize_outbound_headers, validate_request_path, Router,
+    resolve_or_generate_traceparent, rewrite_upstream_path_and_query, sanitize_outbound_headers,
+    validate_request_path, Router, TRACEPARENT_HEADER, TRACE_ID_RESPONSE_HEADER,
 };
 use crate::secrets::{MockSecretProvider, SecretProvider};
 use crate::telemetry::{ReplayRecord, Telemetry};
@@ -329,6 +330,26 @@ impl EdgeGateProxy {
             return resp;
         }
         if path == "/_edgegate/metrics" {
+            let wants_prom_query = req
+                .uri()
+                .query()
+                .is_some_and(|q| q.split('&').any(|kv| kv == "format=prometheus"));
+            let wants_prom_accept = req
+                .headers()
+                .get(ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.contains("text/plain"));
+            if wants_prom_query || wants_prom_accept {
+                let body = Bytes::from(self.telemetry.to_prometheus());
+                let mut resp =
+                    Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+                );
+                return resp;
+            }
             let body = Bytes::from(self.telemetry.to_json());
             let mut resp = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
             *resp.status_mut() = StatusCode::OK;
@@ -346,6 +367,7 @@ impl EdgeGateProxy {
         }
 
         let req_id = self.telemetry.next_request_id();
+        let (traceparent, trace_id) = resolve_or_generate_traceparent(req.headers(), req_id);
         let snap = self.runtime.load_full();
 
         let method = req.method().clone();
@@ -364,7 +386,9 @@ impl EdgeGateProxy {
 
         // Step 1: Fail-closed pre-policy path validation.
         if let Err(err) = validate_request_path(&path) {
-            return self.finish_error(req_id, "-", "-", "-", "-", "BLOCKED", err, started);
+            return self.finish_error(
+                req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
+            );
         }
 
         // Step 2: Authenticate workload (transport-bound UDS identity OR X-EdgeGate-Token header).
@@ -372,13 +396,17 @@ impl EdgeGateProxy {
             Some(ta) => match ta.authenticate(req.headers()) {
                 Ok(id) => id,
                 Err(err) => {
-                    return self.finish_error(req_id, "-", "-", "-", "-", "BLOCKED", err, started);
+                    return self.finish_error(
+                        req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
+                    );
                 }
             },
             None => match snap.auth.authenticate(req.headers()) {
                 Ok(id) => id,
                 Err(err) => {
-                    return self.finish_error(req_id, "-", "-", "-", "-", "BLOCKED", err, started);
+                    return self.finish_error(
+                        req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
+                    );
                 }
             },
         };
@@ -389,6 +417,7 @@ impl EdgeGateProxy {
             None => {
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     "-",
@@ -400,20 +429,52 @@ impl EdgeGateProxy {
             }
         };
 
-        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path policy.
-        if let PolicyDecision::Deny { reason } =
-            snap.policy.evaluate(&identity, &route.id, &method, &path)
-        {
-            return self.finish_error(
-                req_id,
-                &identity.org_id,
-                &identity.workload_id,
-                &route.id,
-                "-",
-                "BLOCKED",
-                EdgeGateError::Forbidden(reason),
-                started,
-            );
+        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path policy + rate limit.
+        match snap.policy.evaluate(&identity, &route.id, &method, &path) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny { reason } => {
+                return self.finish_error(
+                    req_id,
+                    &trace_id,
+                    &identity.org_id,
+                    &identity.workload_id,
+                    &route.id,
+                    "-",
+                    "BLOCKED",
+                    EdgeGateError::Forbidden(reason),
+                    started,
+                );
+            }
+            PolicyDecision::RateLimited { reason } => {
+                self.telemetry.record_replay(ReplayRecord {
+                    request_id: req_id,
+                    trace_id: trace_id.clone(),
+                    org_id: identity.org_id.clone(),
+                    workload_id: identity.workload_id.clone(),
+                    method: method.as_str().to_string(),
+                    path: path.clone(),
+                    route: route.id.clone(),
+                    upstream: "-".to_string(),
+                    status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    shadow_status: None,
+                    reason: "rate_limited".to_string(),
+                    latency_us: started.elapsed().as_micros() as u64,
+                });
+                let mut resp = self.finish_error(
+                    req_id,
+                    &trace_id,
+                    &identity.org_id,
+                    &identity.workload_id,
+                    &route.id,
+                    "-",
+                    "RATE_LIMITED",
+                    EdgeGateError::TooManyRequests(reason),
+                    started,
+                );
+                resp.headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                return resp;
+            }
         }
 
         // Step 5: Select healthy backend via LoadBalancer (supports ConsistentHash routing key).
@@ -423,6 +484,7 @@ impl EdgeGateProxy {
             Err(err) => {
                 self.telemetry.record_replay(ReplayRecord {
                     request_id: req_id,
+                    trace_id: trace_id.clone(),
                     org_id: identity.org_id.clone(),
                     workload_id: identity.workload_id.clone(),
                     method: method.as_str().to_string(),
@@ -436,6 +498,7 @@ impl EdgeGateProxy {
                 });
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -450,7 +513,7 @@ impl EdgeGateProxy {
         let backend_authority = lease.backend.authority.clone();
         let pool_name = lease.pool_name.clone();
 
-        // Step 6: Sanitize outbound headers and inject scoped upstream credential.
+        // Step 6: Sanitize outbound headers, propagate W3C traceparent, and inject scoped upstream credential.
         let target_cred_header = route.credential.as_ref().map(|c| &c.header_name);
         let mut outbound_headers = match sanitize_outbound_headers(
             req.headers(),
@@ -461,6 +524,7 @@ impl EdgeGateProxy {
             Err(err) => {
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -471,6 +535,9 @@ impl EdgeGateProxy {
                 );
             }
         };
+        if let Ok(tp_val) = HeaderValue::from_str(&traceparent) {
+            outbound_headers.insert(HeaderName::from_static(TRACEPARENT_HEADER), tp_val);
+        }
 
         if let Some(ref binding) = route.credential {
             let secret = match snap
@@ -481,6 +548,7 @@ impl EdgeGateProxy {
                 Err(err) => {
                     return self.finish_error(
                         req_id,
+                        &trace_id,
                         &identity.org_id,
                         &identity.workload_id,
                         &route.id,
@@ -497,6 +565,7 @@ impl EdgeGateProxy {
                 Err(_) => {
                     return self.finish_error(
                         req_id,
+                        &trace_id,
                         &identity.org_id,
                         &identity.workload_id,
                         &route.id,
@@ -516,6 +585,7 @@ impl EdgeGateProxy {
             Err(_) => {
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -535,6 +605,7 @@ impl EdgeGateProxy {
             Err(err) => {
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -555,6 +626,7 @@ impl EdgeGateProxy {
             Err(err) => {
                 return self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -577,6 +649,7 @@ impl EdgeGateProxy {
                     snap.lb.record_failure(&pool_name, &backend_id);
                     self.telemetry.record_replay(ReplayRecord {
                         request_id: req_id,
+                        trace_id: trace_id.clone(),
                         org_id: identity.org_id.clone(),
                         workload_id: identity.workload_id.clone(),
                         method: method.as_str().to_string(),
@@ -597,6 +670,7 @@ impl EdgeGateProxy {
                     self.spawn_shadow_dispatch(
                         Arc::clone(&snap),
                         req_id,
+                        trace_id.clone(),
                         identity.org_id.clone(),
                         identity.workload_id.clone(),
                         method.clone(),
@@ -612,6 +686,7 @@ impl EdgeGateProxy {
 
                 self.telemetry.record_request(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -620,7 +695,13 @@ impl EdgeGateProxy {
                     status.as_u16(),
                     latency_us,
                 );
-                resp.map(|b| b.boxed())
+                let mut mapped = resp.map(|b| b.boxed());
+                if let Ok(trace_val) = HeaderValue::from_str(&trace_id) {
+                    mapped
+                        .headers_mut()
+                        .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
+                }
+                mapped
             }
             Err(err) => {
                 let latency_us = started.elapsed().as_micros() as u64;
@@ -629,6 +710,7 @@ impl EdgeGateProxy {
                         snap.lb.record_failure(&pool_name, &backend_id);
                         self.telemetry.record_replay(ReplayRecord {
                             request_id: req_id,
+                            trace_id: trace_id.clone(),
                             org_id: identity.org_id.clone(),
                             workload_id: identity.workload_id.clone(),
                             method: method.as_str().to_string(),
@@ -650,6 +732,7 @@ impl EdgeGateProxy {
                 };
                 self.finish_error(
                     req_id,
+                    &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
@@ -667,6 +750,7 @@ impl EdgeGateProxy {
         &self,
         snap: Arc<RuntimeSnapshot>,
         req_id: u64,
+        trace_id: String,
         org_id: String,
         workload_id: String,
         method: Method,
@@ -708,6 +792,7 @@ impl EdgeGateProxy {
                     if !matched {
                         telemetry.record_replay(ReplayRecord {
                             request_id: req_id,
+                            trace_id,
                             org_id,
                             workload_id,
                             method: method.as_str().to_string(),
@@ -725,6 +810,7 @@ impl EdgeGateProxy {
                     telemetry.record_shadow_outcome(false);
                     telemetry.record_replay(ReplayRecord {
                         request_id: req_id,
+                        trace_id,
                         org_id,
                         workload_id,
                         method: method.as_str().to_string(),
@@ -745,6 +831,7 @@ impl EdgeGateProxy {
     fn finish_error(
         &self,
         request_id: u64,
+        trace_id: &str,
         org_id: &str,
         workload_id: &str,
         route: &str,
@@ -757,6 +844,7 @@ impl EdgeGateProxy {
         let latency_us = started.elapsed().as_micros() as u64;
         self.telemetry.record_request(
             request_id,
+            trace_id,
             org_id,
             workload_id,
             route,
@@ -765,7 +853,12 @@ impl EdgeGateProxy {
             status.as_u16(),
             latency_us,
         );
-        json_error_response(status, &err.public_message())
+        let mut resp = json_error_response(status, &err.public_message());
+        if let Ok(trace_val) = HeaderValue::from_str(trace_id) {
+            resp.headers_mut()
+                .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
+        }
+        resp
     }
 }
 

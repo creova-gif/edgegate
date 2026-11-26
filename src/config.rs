@@ -159,6 +159,12 @@ pub struct PolicyRuleConfig {
     pub methods: Vec<String>,
     #[serde(default = "default_path_prefix")]
     pub path_prefix: String,
+    /// Optional token-bucket refill rate in requests per second (`Milestone 4`).
+    #[serde(default)]
+    pub rate_limit_rps: Option<u32>,
+    /// Optional token-bucket burst capacity (`Milestone 4`; defaults to `rate_limit_rps` when omitted).
+    #[serde(default)]
+    pub rate_limit_burst: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +299,8 @@ pub struct CompiledPolicyRule {
     pub route_id: String,
     pub methods: HashSet<Method>,
     pub path_prefix: String,
+    pub rate_limit_rps: Option<u32>,
+    pub rate_limit_burst: Option<u32>,
 }
 
 impl CompiledConfig {
@@ -598,6 +606,18 @@ impl CompiledConfig {
                     pol.route_id
                 )));
             }
+            if pol.rate_limit_rps == Some(0) {
+                return Err(EdgeGateError::Config(format!(
+                    "policy for route '{}' rate_limit_rps must be > 0",
+                    pol.route_id
+                )));
+            }
+            if pol.rate_limit_burst == Some(0) {
+                return Err(EdgeGateError::Config(format!(
+                    "policy for route '{}' rate_limit_burst must be > 0",
+                    pol.route_id
+                )));
+            }
             let mut methods = HashSet::with_capacity(pol.methods.len());
             for m in pol.methods {
                 let parsed =
@@ -613,6 +633,8 @@ impl CompiledConfig {
                 route_id: pol.route_id,
                 methods,
                 path_prefix: pol.path_prefix,
+                rate_limit_rps: pol.rate_limit_rps,
+                rate_limit_burst: pol.rate_limit_burst,
             });
         }
 

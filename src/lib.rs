@@ -24,6 +24,8 @@ pub enum EdgeGateError {
     Forbidden(String),
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
     #[error("bad gateway: {0}")]
     BadGateway(String),
     #[error("pool exhausted: {0}")]
@@ -43,6 +45,7 @@ impl EdgeGateError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::PoolExhausted(_) | Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::GatewayTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -56,6 +59,7 @@ impl EdgeGateError {
             Self::Unauthorized(_) => "unauthorized workload identity".to_string(),
             Self::Forbidden(_) => "access denied by edgegate policy".to_string(),
             Self::PayloadTooLarge(m) => m.clone(),
+            Self::TooManyRequests(_) => "rate limit exceeded by edgegate policy".to_string(),
             Self::BadGateway(_) => "upstream connection error".to_string(),
             Self::PoolExhausted(_) => "upstream connection pool exhausted".to_string(),
             Self::ServiceUnavailable(_) => "no healthy upstream backends available".to_string(),
