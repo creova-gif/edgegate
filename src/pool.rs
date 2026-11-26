@@ -446,12 +446,15 @@ impl ConnectionPool {
         allow_private_ip: bool,
         tls_connector: Option<&TlsConnector>,
     ) -> Result<Http1SendRequest<Full<Bytes>>, EdgeGateError> {
-        let validated_addr =
-            resolve_and_validate_addr(&backend.host, backend.port, allow_private_ip).await?;
-        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(validated_addr))
-            .await
-            .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
-            .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
+        let validated_addrs =
+            resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
+        let stream = tokio::time::timeout(
+            self.connect_timeout,
+            TcpStream::connect(&validated_addrs[..]),
+        )
+        .await
+        .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
+        .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
 
         let _ = stream.set_nodelay(true);
 
@@ -502,12 +505,15 @@ impl ConnectionPool {
         allow_private_ip: bool,
         tls_connector: Option<&TlsConnector>,
     ) -> Result<Http2SendRequest<Full<Bytes>>, EdgeGateError> {
-        let validated_addr =
-            resolve_and_validate_addr(&backend.host, backend.port, allow_private_ip).await?;
-        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(validated_addr))
-            .await
-            .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
-            .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
+        let validated_addrs =
+            resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
+        let stream = tokio::time::timeout(
+            self.connect_timeout,
+            TcpStream::connect(&validated_addrs[..]),
+        )
+        .await
+        .map_err(|_| EdgeGateError::GatewayTimeout("upstream TCP connect timeout".to_string()))?
+        .map_err(|e| EdgeGateError::BadGateway(format!("upstream TCP connect failed: {e}")))?;
 
         let _ = stream.set_nodelay(true);
 
@@ -578,18 +584,18 @@ fn build_tls_connector(
     Some(TlsConnector::from(Arc::new(config)))
 }
 
-pub async fn resolve_and_validate_addr(
+pub async fn resolve_and_validate_addrs(
     host: &str,
     port: u16,
     allow_private_ip: bool,
-) -> Result<SocketAddr, EdgeGateError> {
+) -> Result<Vec<SocketAddr>, EdgeGateError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !allow_private_ip && is_blocked_ip(ip) {
             return Err(EdgeGateError::Forbidden(format!(
                 "SSRF guard blocked upstream IP '{ip}'"
             )));
         }
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
@@ -614,7 +620,7 @@ pub async fn resolve_and_validate_addr(
         }
     }
 
-    Ok(addrs[0])
+    Ok(addrs)
 }
 
 pub fn is_blocked_ip(ip: IpAddr) -> bool {

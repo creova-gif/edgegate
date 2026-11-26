@@ -4,11 +4,12 @@ use std::sync::Mutex;
 
 use tracing::info;
 
-/// Sanitized flight-recorder entry for failed (`5xx`/`502`/`503`/`504`) or shadow-mismatched requests.
+/// Sanitized flight-recorder entry for failed (`5xx`/`502`/`503`/`504`), rate-limited (`429`), or shadow-mismatched requests.
 /// Strictly excludes request/response headers, bodies, and secret material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayRecord {
     pub request_id: u64,
+    pub trace_id: String,
     pub org_id: String,
     pub workload_id: String,
     pub method: String,
@@ -21,12 +22,13 @@ pub struct ReplayRecord {
     pub latency_us: u64,
 }
 
-/// Atomic request, decision, shadow, reload, and flight-recorder telemetry (`Milestone 3`).
+/// Atomic request, decision, rate-limit, shadow, reload, and flight-recorder telemetry (`Milestone 4`).
 #[derive(Debug)]
 pub struct Telemetry {
     request_seq: AtomicU64,
     allowed_total: AtomicU64,
     blocked_total: AtomicU64,
+    rate_limited_total: AtomicU64,
     upstream_errors_total: AtomicU64,
     reloads_total: AtomicU64,
     reload_failures_total: AtomicU64,
@@ -41,6 +43,7 @@ pub struct Telemetry {
 pub struct TelemetrySnapshot {
     pub allowed_total: u64,
     pub blocked_total: u64,
+    pub rate_limited_total: u64,
     pub upstream_errors_total: u64,
     pub reloads_total: u64,
     pub reload_failures_total: u64,
@@ -66,6 +69,7 @@ impl Telemetry {
             request_seq: AtomicU64::new(0),
             allowed_total: AtomicU64::new(0),
             blocked_total: AtomicU64::new(0),
+            rate_limited_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
             reloads_total: AtomicU64::new(0),
             reload_failures_total: AtomicU64::new(0),
@@ -125,8 +129,9 @@ impl Telemetry {
                 None => "null".to_string(),
             };
             items.push(format!(
-                "{{\"request_id\":{},\"org_id\":\"{}\",\"workload_id\":\"{}\",\"method\":\"{}\",\"path\":\"{}\",\"route\":\"{}\",\"upstream\":\"{}\",\"status\":{},\"shadow_status\":{},\"reason\":\"{}\",\"latency_us\":{}}}",
+                "{{\"request_id\":{},\"trace_id\":\"{}\",\"org_id\":\"{}\",\"workload_id\":\"{}\",\"method\":\"{}\",\"path\":\"{}\",\"route\":\"{}\",\"upstream\":\"{}\",\"status\":{},\"shadow_status\":{},\"reason\":\"{}\",\"latency_us\":{}}}",
                 r.request_id,
+                escape_json(&r.trace_id),
                 escape_json(&r.org_id),
                 escape_json(&r.workload_id),
                 escape_json(&r.method),
@@ -146,6 +151,7 @@ impl Telemetry {
         TelemetrySnapshot {
             allowed_total: self.allowed_total.load(Ordering::Relaxed),
             blocked_total: self.blocked_total.load(Ordering::Relaxed),
+            rate_limited_total: self.rate_limited_total.load(Ordering::Relaxed),
             upstream_errors_total: self.upstream_errors_total.load(Ordering::Relaxed),
             reloads_total: self.reloads_total.load(Ordering::Relaxed),
             reload_failures_total: self.reload_failures_total.load(Ordering::Relaxed),
@@ -158,9 +164,53 @@ impl Telemetry {
     pub fn to_json(&self) -> String {
         let s = self.snapshot();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{}}}",
             s.allowed_total,
             s.blocked_total,
+            s.rate_limited_total,
+            s.upstream_errors_total,
+            s.reloads_total,
+            s.reload_failures_total,
+            s.config_generation,
+            s.shadow_requests_total,
+            s.shadow_mismatches_total
+        )
+    }
+
+    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and `config_generation` (`Milestone 4`).
+    pub fn to_prometheus(&self) -> String {
+        let s = self.snapshot();
+        format!(
+            "# HELP edgegate_requests_allowed_total Total requests allowed by EdgeGate policy.\n\
+             # TYPE edgegate_requests_allowed_total counter\n\
+             edgegate_requests_allowed_total {}\n\
+             # HELP edgegate_requests_blocked_total Total requests blocked by EdgeGate authentication or policy.\n\
+             # TYPE edgegate_requests_blocked_total counter\n\
+             edgegate_requests_blocked_total {}\n\
+             # HELP edgegate_requests_rate_limited_total Total requests rejected by EdgeGate token-bucket rate limiter.\n\
+             # TYPE edgegate_requests_rate_limited_total counter\n\
+             edgegate_requests_rate_limited_total {}\n\
+             # HELP edgegate_upstream_errors_total Total upstream 5xx or transport errors.\n\
+             # TYPE edgegate_upstream_errors_total counter\n\
+             edgegate_upstream_errors_total {}\n\
+             # HELP edgegate_reloads_total Total successful atomic configuration reloads.\n\
+             # TYPE edgegate_reloads_total counter\n\
+             edgegate_reloads_total {}\n\
+             # HELP edgegate_reload_failures_total Total rejected configuration reload attempts.\n\
+             # TYPE edgegate_reload_failures_total counter\n\
+             edgegate_reload_failures_total {}\n\
+             # HELP edgegate_config_generation Active atomic configuration generation number.\n\
+             # TYPE edgegate_config_generation gauge\n\
+             edgegate_config_generation {}\n\
+             # HELP edgegate_shadow_requests_total Total asynchronous shadow requests dispatched.\n\
+             # TYPE edgegate_shadow_requests_total counter\n\
+             edgegate_shadow_requests_total {}\n\
+             # HELP edgegate_shadow_mismatches_total Total shadow responses whose status differed from primary.\n\
+             # TYPE edgegate_shadow_mismatches_total counter\n\
+             edgegate_shadow_mismatches_total {}\n",
+            s.allowed_total,
+            s.blocked_total,
+            s.rate_limited_total,
             s.upstream_errors_total,
             s.reloads_total,
             s.reload_failures_total,
@@ -176,6 +226,7 @@ impl Telemetry {
     pub fn record_request(
         &self,
         request_id: u64,
+        trace_id: &str,
         org_id: &str,
         workload_id: &str,
         route: &str,
@@ -194,6 +245,9 @@ impl Telemetry {
             "BLOCKED" => {
                 self.blocked_total.fetch_add(1, Ordering::Relaxed);
             }
+            "RATE_LIMITED" => {
+                self.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {
                 self.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
             }
@@ -202,6 +256,7 @@ impl Telemetry {
         info!(
             target: "edgegate::audit",
             request_id = request_id,
+            trace_id = trace_id,
             org_id = org_id,
             workload_id = workload_id,
             route = route,

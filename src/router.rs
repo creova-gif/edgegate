@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use http::header::{HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHORIZATION};
 use http::HeaderMap;
 
@@ -5,6 +7,12 @@ use crate::auth::WORKLOAD_TOKEN_HEADER;
 use crate::config::CompiledRoute;
 use crate::policy::path_matches_prefix;
 use crate::EdgeGateError;
+
+/// W3C Trace Context header propagated upstream (`Milestone 4`).
+pub const TRACEPARENT_HEADER: &str = "traceparent";
+
+/// Response header returning the active 32-hex trace identifier to callers (`Milestone 4`).
+pub const TRACE_ID_RESPONSE_HEADER: &str = "x-edgegate-trace-id";
 
 /// Standard RFC 9110 hop-by-hop headers (excluding `content-length` and `transfer-encoding`,
 /// which are framing headers managed by `hyper` v1).
@@ -158,6 +166,58 @@ pub fn sanitize_outbound_headers(
     })?;
     out.insert(HOST, host_val);
     Ok(out)
+}
+
+/// Validates an incoming W3C `traceparent` header (`00-<32 hex>-<16 hex>-<2 hex>`) and extracts
+/// `(traceparent, trace_id)`, or generates a fresh W3C `traceparent` and 32-hex `trace_id` from
+/// `request_id` and timestamp if absent or malformed (`Milestone 4`).
+pub fn resolve_or_generate_traceparent(incoming: &HeaderMap, request_id: u64) -> (String, String) {
+    if let Some(raw) = incoming
+        .get(TRACEPARENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(valid) = parse_w3c_traceparent(raw) {
+            return valid;
+        }
+    }
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let non_zero_req = request_id.max(1);
+    let trace_id = format!("{now_ns:016x}{non_zero_req:016x}");
+    let span_id = format!("{non_zero_req:016x}");
+    let traceparent = format!("00-{trace_id}-{span_id}-01");
+    (traceparent, trace_id)
+}
+
+fn parse_w3c_traceparent(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.len() != 55 {
+        return None;
+    }
+    let mut parts = trimmed.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let parent_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if version != "00"
+        || trace_id.len() != 32
+        || parent_id.len() != 16
+        || flags.len() != 2
+        || trace_id.bytes().all(|b| b == b'0')
+        || parent_id.bytes().all(|b| b == b'0')
+        || !trace_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !parent_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !flags.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let trace_id_str = trace_id.to_string();
+    Some((trimmed, trace_id_str))
 }
 
 #[cfg(test)]

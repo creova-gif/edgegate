@@ -1,3 +1,6 @@
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use http::Method;
 
 use crate::auth::WorkloadIdentity;
@@ -7,6 +10,7 @@ use crate::config::CompiledPolicyRule;
 pub enum PolicyDecision {
     Allow,
     Deny { reason: String },
+    RateLimited { reason: String },
 }
 
 /// Trait seam for authorization policy evaluation.
@@ -20,15 +24,70 @@ pub trait PolicyEngine: Send + Sync {
     ) -> PolicyDecision;
 }
 
-/// Default-deny policy engine checking `(org_id, workload_id, required_roles, route_id, method, path_prefix)`.
+/// Token-bucket rate limiter per policy rule (`Milestone 4`).
+#[derive(Debug)]
+struct TokenBucket {
+    rate_per_sec: f64,
+    capacity: f64,
+    state: Mutex<(f64, Instant)>,
+}
+
+impl TokenBucket {
+    fn new(rps: u32, burst: u32) -> Self {
+        let capacity = f64::from(burst.max(1));
+        Self {
+            rate_per_sec: f64::from(rps.max(1)),
+            capacity,
+            state: Mutex::new((capacity, Instant::now())),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let elapsed = now.duration_since(guard.1).as_secs_f64();
+        guard.0 = (guard.0 + elapsed * self.rate_per_sec).min(self.capacity);
+        guard.1 = now;
+        if guard.0 >= 1.0 {
+            guard.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyRuleEntry {
+    rule: CompiledPolicyRule,
+    limiter: Option<Arc<TokenBucket>>,
+}
+
+/// Default-deny policy engine checking `(org_id, workload_id, required_roles, route_id, method, path_prefix)`
+/// and enforcing optional per-rule token-bucket rate limits.
 #[derive(Debug, Clone)]
 pub struct DefaultDenyPolicyEngine {
-    rules: Vec<CompiledPolicyRule>,
+    entries: Vec<PolicyRuleEntry>,
 }
 
 impl DefaultDenyPolicyEngine {
     pub fn new(rules: Vec<CompiledPolicyRule>) -> Self {
-        Self { rules }
+        let entries = rules
+            .into_iter()
+            .map(|rule| {
+                let limiter = match (rule.rate_limit_rps, rule.rate_limit_burst) {
+                    (Some(rps), Some(burst)) => Some(Arc::new(TokenBucket::new(rps, burst))),
+                    (Some(rps), None) => Some(Arc::new(TokenBucket::new(rps, rps))),
+                    (None, Some(burst)) => Some(Arc::new(TokenBucket::new(burst, burst))),
+                    (None, None) => None,
+                };
+                PolicyRuleEntry { rule, limiter }
+            })
+            .collect();
+        Self { entries }
     }
 }
 
@@ -40,7 +99,8 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
         method: &Method,
         path: &str,
     ) -> PolicyDecision {
-        for rule in &self.rules {
+        for entry in &self.entries {
+            let rule = &entry.rule;
             if rule.org_id != identity.org_id {
                 continue;
             }
@@ -63,6 +123,16 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
                 continue;
             }
             if path_matches_prefix(path, &rule.path_prefix) {
+                if let Some(ref bucket) = entry.limiter {
+                    if !bucket.try_acquire() {
+                        return PolicyDecision::RateLimited {
+                            reason: format!(
+                                "rate-limited: org '{}' workload '{}' exceeded token bucket on route '{}'",
+                                identity.org_id, identity.workload_id, route_id
+                            ),
+                        };
+                    }
+                }
                 return PolicyDecision::Allow;
             }
         }
@@ -106,6 +176,8 @@ mod tests {
             route_id: "github".to_string(),
             methods,
             path_prefix: "/v1/github/repos".to_string(),
+            rate_limit_rps: None,
+            rate_limit_burst: None,
         }])
     }
 
