@@ -8,9 +8,16 @@ use crate::config::CompiledPolicyRule;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
-    Allow { max_body_bytes: Option<usize> },
-    Deny { reason: String },
-    RateLimited { reason: String },
+    Allow {
+        max_body_bytes: Option<usize>,
+        blocked_body_substrings: Vec<String>,
+    },
+    Deny {
+        reason: String,
+    },
+    RateLimited {
+        reason: String,
+    },
 }
 
 /// Trait seam for authorization policy evaluation.
@@ -180,6 +187,7 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
             }
             return PolicyDecision::Allow {
                 max_body_bytes: rule.max_body_bytes,
+                blocked_body_substrings: rule.blocked_body_substrings.clone(),
             };
         }
 
@@ -224,6 +232,7 @@ mod tests {
             path_prefix: "/v1/github/repos".to_string(),
             required_headers: HashMap::new(),
             forbidden_query_params: Vec::new(),
+            blocked_body_substrings: Vec::new(),
             max_body_bytes: None,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -241,7 +250,8 @@ mod tests {
         assert_eq!(
             engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
             PolicyDecision::Allow {
-                max_body_bytes: None
+                max_body_bytes: None,
+                blocked_body_substrings: Vec::new(),
             }
         );
     }

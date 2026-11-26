@@ -28,7 +28,7 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║                                                                                  ║
 ║  [Step 0] Observability (`/_edgegate/healthz`, `/metrics`, `/replay`) &          ║
 ║     │     Authenticated Admin Control Plane (`/_edgegate/admin/{reload,          ║
-║     │     secrets/rotate,audit}`, constant-time `X-EdgeGate-Admin-Token`,        ║
+║     │     secrets/rotate,audit,pools}`, constant-time `X-EdgeGate-Admin-Token`,  ║
 ║     │     disabled fail-closed when `admin_token` is unconfigured)               ║
 ║     ▼                                                                            ║
 ║  [Step 1] Fail-Closed Path Normalization Guard (`validate_request_path`)         ║
@@ -44,32 +44,37 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║  [Step 4] Default-Deny Multi-Tenant RBAC, Attribute & Query Policy (`INV-15/17`) ║
 ║     │     Enforces `(org_id, workload_id, required_roles, route_id, method, pfx, ║
 ║     │     required_headers, forbidden_query_params)` and resolves per-rule       ║
-║     │     `max_body_bytes` ceiling (`403 Forbidden` on policy/query violation)   ║
+║     │     `max_body_bytes` & `blocked_body_substrings` (`403` on violation)      ║
 ║     ▼                                                                            ║
 ║  [Step 5] Per-Workload Token-Bucket Rate Limiter (`TokenBucketRateLimiter`)      ║
 ║     │     Enforces `rate_limit_rps` & `rate_limit_burst` (`429 Too Many Reqs`)   ║
 ║     ▼                                                                            ║
-║  [Step 6] Weighted Load Balancer & 3-State Circuit Breaker (`PoolLoadBalancer`)  ║
+║  [Step 6] Bounded Body Collection & Egress DLP Payload Guard (`INV-17`, `INV-19`)║
+║     │     • Enforces `min(server.max_request_body_bytes, policy.max_body_bytes)` ║
+║     │       via `http_body_util::Limited` (`413 Payload Too Large` on overflow)  ║
+║     │     • Scans body against `blocked_body_substrings`; rejects exfiltration   ║
+║     │       fail-closed with `403 Forbidden` (`dlp_blocked_total`)               ║
+║     ▼                                                                            ║
+║  [Step 7] Weighted Load Balancer & 3-State Circuit Breaker (`PoolLoadBalancer`)  ║
 ║     │     Weighted `RoundRobin` | `LeastConnections` | `ConsistentHash` | `EWMA` ║
 ║     │     Acquires RAII `BackendLease` (`Closed` / `Open` / `HalfOpen` probe)    ║
 ║     ▼                                                                            ║
-║  [Step 7] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
+║  [Step 8] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
 ║     │     Strips hop-by-hop, `X-EdgeGate-Token`, `Proxy-Authorization`, forged   ║
 ║     │     auth headers; verifies secret TTL (`expires_at_epoch_s`, `403` on      ║
 ║     │     expiry) and injects W3C `traceparent` + `(org_id, credential_ref)`     ║
 ║     ▼                                                                            ║
-║  [Step 8] Bounded Body Collection (`http_body_util::Limited`, `413` on overflow) ║
-║     │     Enforces `min(server.max_request_body_bytes, policy.max_body_bytes)`   ║
-║     ▼                                                                            ║
-║  [Step 9] Bounded Connection Pool + SSRF Defense + Idempotent Failover           ║
+║  [Step 9] Bounded Connection Pool + Outbound mTLS (`INV-18`) + SSRF + Failover   ║
 ║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
-║     │     • HTTP/1.1 single-flight (`PooledBody` EOF-drain guard) or HTTP/2 `h2` ║
+║     │     • Outbound TLS 1.2/1.3 & optional Mutual TLS (`client_cert_pem` +      ║
+║     │       `client_key_pem`), HTTP/1.1 `PooledBody` guard or HTTP/2 `h2`        ║
 ║     │     • Controlled failover (`max_idempotent_retries`) for `GET`/`HEAD`/     ║
 ║     │       `OPTIONS` only; never follows `3xx` or retries state-mutating verbs  ║
 ║     ▼                                                                            ║
-║  [Step 10] Defense-in-Depth Response Credential Reflection Guard & Audit Chain   ║
+║  [Step 10] Response Reflection Guard, Header Hardening & Audit Chain (`INV-16`)  ║
 ║           • When `block_secret_reflection = true`, inspects upstream response    ║
 ║             headers and body; blocks leaked secrets with `502 Bad Gateway`       ║
+║           • Applies route `strip_response_headers` & `inject_response_headers`   ║
 ║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->             ║
 ║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram    ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
@@ -327,3 +332,26 @@ Policy rules (`[[policies]]`) support granular L7 query and payload resource con
 
 ### Lock-Free Prometheus Latency Histograms (`edgegate_request_duration_microseconds_bucket`)
 `Telemetry` tracks end-to-end request duration in lock-free `AtomicU64` cumulative microsecond buckets (`le="100"`, `le="500"`, `le="1000"`, `le="5000"`, `le="10000"`, `le="50000"`, `le="+Inf"`), plus `_sum` and `_count`, exported at `GET /_edgegate/metrics?format=prometheus` (`edgegate_request_duration_microseconds_bucket`).
+
+---
+
+## 12. Outbound Mutual TLS (mTLS), Egress DLP Payload Guard, Programmable Response Header Hardening & Admin Pool Introspection (`Milestone 8` / `v0.8.0`)
+
+### Outbound Mutual TLS (mTLS) Client Authentication (`INV-18`, `client_cert_pem`, `client_key_pem`)
+Backend pools (`[[pools]]`) may configure optional `client_cert_pem` and `client_key_pem` PEM blocks so EdgeGate authenticates itself to mTLS-enforcing upstreams without exposing private key material to workloads:
+1. **Fail-Closed Pairing & Compile-Time Validation:** `CompiledConfig::compile` requires both `client_cert_pem` and `client_key_pem` to be provided together, parses the certificate chain (`rustls_pemfile::certs`) and private key (`rustls_pemfile::private_key`), and validates key/certificate pairing via `rustls::ClientConfig::builder().with_client_auth_cert(...)` before accepting a startup or hot-reload configuration.
+2. **Outbound Handshake Presentation:** During upstream TLS 1.2/1.3 handshakes (`ConnectionPool::build_tls_connector`), EdgeGate presents the compiled client certificate chain and signs the TLS CertificateVerify transcript for both HTTP/1.1 and multiplexed HTTP/2 (`h2` ALPN) connections.
+
+### Egress Data Loss Prevention (DLP) Request Payload Guard (`INV-19`, `blocked_body_substrings`)
+Policy rules (`[[policies]]`) support `blocked_body_substrings: Vec<String>` to prevent data exfiltration inside authorized outbound requests:
+- Immediately after bounded request body collection (`http_body_util::Limited`) and before any upstream socket checkout or secret transmission, EdgeGate scans the raw request payload bytes for every configured substring in `blocked_body_substrings`.
+- If a match is found, EdgeGate aborts the request fail-closed with `403 Forbidden` (`{"error":"request blocked by egress DLP policy"}`), increments `dlp_blocked_total` (`edgegate_dlp_blocked_total`), records a sanitized flight-recorder entry (`reason = "dlp_payload_blocked"`) in `/_edgegate/replay`, and appends a `BLOCKED` record to the SHA-256 hash-chained audit ledger (`INV-16`).
+
+### Programmable Response Header Stripping & Security Header Injection (`strip_response_headers`, `inject_response_headers`)
+Routes (`[[routes]]`) support declarative outbound response header hardening:
+- **`strip_response_headers`:** Removes specified upstream headers (e.g., `Server`, `X-Powered-By`, internal debug headers) case-insensitively before returning the response to the workload.
+- **`inject_response_headers`:** Inserts or overwrites security and caching headers (e.g., `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`) on the returned response.
+
+### Admin Pool & Circuit-Breaker Topology Introspection (`GET /_edgegate/admin/pools`) & CLI `edgegate audit`
+- **`GET /_edgegate/admin/pools`:** Authenticated by constant-time `X-EdgeGate-Admin-Token` verification, returns a live JSON snapshot of every configured backend pool (`name`, `strategy`, `mtls_enabled`) and each backend's runtime state (`id`, `address`, `weight`, `tls`, `http2`, `active_healthy`, `circuit_state` in `{"closed","open","half_open"}`, `active_connections`, and `ewma_latency_us`).
+- **`edgegate audit` CLI Subcommand:** Allows operators to fetch and verify the cryptographic SHA-256 hash-chained audit ledger from `/_edgegate/admin/audit` directly via `edgegate audit --url <URL> --admin-token <TOKEN>`.

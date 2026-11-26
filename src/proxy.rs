@@ -440,8 +440,9 @@ impl EdgeGateProxy {
 
         let snap = self.runtime.load_full();
 
-        // Step 0b: Authenticated Admin Control Plane (`Milestone 7`).
+        // Step 0b: Authenticated Admin Control Plane (`Milestone 7` & `Milestone 8`).
         if path == "/_edgegate/admin/audit"
+            || path == "/_edgegate/admin/pools"
             || path == "/_edgegate/admin/reload"
             || path == "/_edgegate/admin/secrets/rotate"
         {
@@ -450,6 +451,15 @@ impl EdgeGateProxy {
             }
             if path == "/_edgegate/admin/audit" && req.method() == Method::GET {
                 let body = Bytes::from(self.telemetry.audit_to_json());
+                let mut resp =
+                    Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                return resp;
+            }
+            if path == "/_edgegate/admin/pools" && req.method() == Method::GET {
+                let body = Bytes::from(snap.lb.pools_status_json());
                 let mut resp =
                     Response::new(Full::new(body).map_err(|never| match never {}).boxed());
                 *resp.status_mut() = StatusCode::OK;
@@ -596,7 +606,7 @@ impl EdgeGateProxy {
         };
 
         // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/query/headers policy + rate limit.
-        let rule_max_body_bytes = match snap.policy.evaluate_request(
+        let (rule_max_body_bytes, blocked_body_substrings) = match snap.policy.evaluate_request(
             &identity,
             &route.id,
             &method,
@@ -604,7 +614,10 @@ impl EdgeGateProxy {
             query.as_deref(),
             req.headers(),
         ) {
-            PolicyDecision::Allow { max_body_bytes } => max_body_bytes,
+            PolicyDecision::Allow {
+                max_body_bytes,
+                blocked_body_substrings,
+            } => (max_body_bytes, blocked_body_substrings),
             PolicyDecision::Deny { reason } => {
                 return self.finish_error(
                     req_id,
@@ -775,6 +788,42 @@ impl EdgeGateProxy {
                 );
             }
         };
+
+        // Step 6b: Egress DLP Request Payload Guard (`Milestone 8`).
+        if let Some(matched_pat) = blocked_body_substrings.iter().find(|pat| {
+            let needle = pat.as_bytes();
+            !needle.is_empty() && collected.windows(needle.len()).any(|w| w == needle)
+        }) {
+            let latency_us = started.elapsed().as_micros() as u64;
+            self.telemetry.record_dlp_blocked();
+            self.telemetry.record_replay(ReplayRecord {
+                request_id: req_id,
+                trace_id: trace_id.clone(),
+                org_id: identity.org_id.clone(),
+                workload_id: identity.workload_id.clone(),
+                method: method.as_str().to_string(),
+                path: path.clone(),
+                route: route.id.clone(),
+                upstream: backend_id.clone(),
+                status: StatusCode::FORBIDDEN.as_u16(),
+                shadow_status: None,
+                reason: "dlp_payload_blocked".to_string(),
+                latency_us,
+            });
+            return self.finish_error(
+                req_id,
+                &trace_id,
+                &identity.org_id,
+                &identity.workload_id,
+                &route.id,
+                &backend_id,
+                "BLOCKED",
+                EdgeGateError::Forbidden(format!(
+                    "egress DLP blocked forbidden payload pattern '{matched_pat}'"
+                )),
+                started,
+            );
+        }
 
         let upstream_pq = rewrite_upstream_path_and_query(&path, query.as_deref(), &route);
         let upstream_uri = match Uri::builder().path_and_query(upstream_pq.as_str()).build() {
@@ -1024,6 +1073,14 @@ impl EdgeGateProxy {
                     latency_us,
                 );
                 let mut mapped = mapped;
+                for hdr_name in &route.strip_response_headers {
+                    mapped.headers_mut().remove(hdr_name);
+                }
+                for (hdr_name, hdr_val) in &route.inject_response_headers {
+                    mapped
+                        .headers_mut()
+                        .insert(hdr_name.clone(), hdr_val.clone());
+                }
                 if let Ok(trace_val) = HeaderValue::from_str(&trace_id) {
                     mapped
                         .headers_mut()

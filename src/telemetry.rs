@@ -64,6 +64,7 @@ pub struct Telemetry {
     shadow_mismatches_total: AtomicU64,
     secret_reflections_blocked_total: AtomicU64,
     secret_rotations_total: AtomicU64,
+    dlp_blocked_total: AtomicU64,
     retries_total: AtomicU64,
     in_flight_requests: AtomicU64,
     latency_le_100us: AtomicU64,
@@ -92,6 +93,7 @@ pub struct TelemetrySnapshot {
     pub shadow_mismatches_total: u64,
     pub secret_reflections_blocked_total: u64,
     pub secret_rotations_total: u64,
+    pub dlp_blocked_total: u64,
     pub retries_total: u64,
     pub in_flight_requests: u64,
 }
@@ -122,6 +124,7 @@ impl Telemetry {
             shadow_mismatches_total: AtomicU64::new(0),
             secret_reflections_blocked_total: AtomicU64::new(0),
             secret_rotations_total: AtomicU64::new(0),
+            dlp_blocked_total: AtomicU64::new(0),
             retries_total: AtomicU64::new(0),
             in_flight_requests: AtomicU64::new(0),
             latency_le_100us: AtomicU64::new(0),
@@ -169,6 +172,10 @@ impl Telemetry {
 
     pub fn record_secret_rotation(&self) {
         self.secret_rotations_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dlp_blocked(&self) {
+        self.dlp_blocked_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reload_success(&self) -> u64 {
@@ -248,6 +255,7 @@ impl Telemetry {
                 .secret_reflections_blocked_total
                 .load(Ordering::Relaxed),
             secret_rotations_total: self.secret_rotations_total.load(Ordering::Relaxed),
+            dlp_blocked_total: self.dlp_blocked_total.load(Ordering::Relaxed),
             retries_total: self.retries_total.load(Ordering::Relaxed),
             in_flight_requests: self.in_flight_requests.load(Ordering::Acquire),
         }
@@ -257,7 +265,7 @@ impl Telemetry {
         let s = self.snapshot();
         let audit_valid = self.verify_audit_chain();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"dlp_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -269,6 +277,7 @@ impl Telemetry {
             s.shadow_mismatches_total,
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
+            s.dlp_blocked_total,
             s.retries_total,
             s.in_flight_requests,
             audit_valid
@@ -320,6 +329,9 @@ impl Telemetry {
              # HELP edgegate_secret_rotations_total Total live in-memory secret rotations.\n\
              # TYPE edgegate_secret_rotations_total counter\n\
              edgegate_secret_rotations_total {}\n\
+             # HELP edgegate_dlp_blocked_total Total outbound requests blocked by EdgeGate DLP payload inspection.\n\
+             # TYPE edgegate_dlp_blocked_total counter\n\
+             edgegate_dlp_blocked_total {}\n\
              # HELP edgegate_retries_total Total controlled idempotent upstream failover retries.\n\
              # TYPE edgegate_retries_total counter\n\
              edgegate_retries_total {}\n\
@@ -348,6 +360,7 @@ impl Telemetry {
             s.shadow_mismatches_total,
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
+            s.dlp_blocked_total,
             s.retries_total,
             s.in_flight_requests,
             b100,

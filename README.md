@@ -15,9 +15,9 @@
 When AI agents or untrusted code execute inside containers or microVMs, giving them raw API keys (`OPENAI_API_KEY`, `GITHUB_TOKEN`, internal service credentials) means any prompt injection, dependency vulnerability, or arbitrary code execution immediately compromises those secrets. Conversely, routing sandbox traffic through a traditional `HTTP_PROXY` MITM forward proxy introduces custom CA distribution complexity and exposes the host network to DNS-rebinding SSRF and credential-redirect leaks.
 
 EdgeGate solves this at the systems layer:
-1. **Zero Secrets in the Sandbox:** Workloads hold zero upstream API keys—and **zero bearer tokens of any kind** when connected over host-mounted or dynamically attached Unix domain sockets (`register_boxlet_sandbox`). EdgeGate authenticates the workload (supporting zero-downtime dual-token rollover via `secondary_token` / `secondary_token_sha256`), evaluates a default-deny multi-tenant RBAC and request-attribute policy (`required_headers`, `forbidden_query_params`, per-rule `max_body_bytes`), strips forged/hop-by-hop headers, injects the scoped, TTL-checked upstream secret (`expires_at_epoch_s`, live-rotatable via `EdgeGateProxy::rotate_secret` or `/_edgegate/admin/secrets/rotate`) on the wire, and optionally guards responses against accidental or malicious upstream secret reflection (`block_secret_reflection = true`).
-2. **Fail-Closed L7 Security Pipeline:** Every request passes through a linear, strongly-typed security pipeline that enforces pre-policy path normalization (`400`), constant-time SHA-256 primary/secondary token verification (`401`), multi-tenant RBAC, L7 attribute/MCP tool policy, & forbidden query-parameter filtering (`403`, `INV-15`, `INV-17`), per-rule and server-wide request payload size ceilings (`413`, `INV-17`), per-workload token-bucket rate limiting (`429`), scoped credential TTL expiry enforcement (`403`, `INV-14`), resolve-validate-connect SSRF protection across IPv4/IPv6/mapped-IPv6 (`403`), zero `3xx` redirect following, response credential reflection blocking (`502`), and a cryptographic SHA-256 hash-chained tamper-evident audit ledger (`INV-16`).
-3. **Production-Grade Resilience, Control Plane & Observability:** Features inbound TLS 1.2/1.3 termination (`[server.tls]`, ALPN `h2` & `http/1.1`), single-flight HTTP/1.1 connection pooling with RAII EOF-drain guards (`PooledBody`), multiplexed HTTP/2 (`h2` TLS ALPN & `h2c`), four load-balancing algorithms (`RoundRobin`, `LeastConnections`, `ConsistentHash`, `LatencyAware` EWMA) with weighted canary traffic splitting (`weight` on `[[pools.backends]]`), three-state circuit breakers (`Closed` -> `Open` -> `HalfOpen` single-flight probe), controlled idempotent-only failover retries (`max_idempotent_retries`), graceful in-flight connection draining (`drain_timeout_ms`), atomic zero-downtime hot reload (`ArcSwap`), an authenticated Admin Control Plane API (`/_edgegate/admin/reload`, `/_edgegate/admin/secrets/rotate`, `/_edgegate/admin/audit` guarded by constant-time `X-EdgeGate-Admin-Token`), lock-free Prometheus microsecond latency histograms (`edgegate_request_duration_microseconds_bucket`), W3C `traceparent` propagation, live traffic shadowing, a sanitized flight-recorder replay buffer (`/_edgegate/replay`), and operator inspection CLI subcommands (`edgegate status`, `edgegate replay`).
+1. **Zero Secrets in the Sandbox:** Workloads hold zero upstream API keys, zero X.509 client private keys, and **zero bearer tokens of any kind** when connected over host-mounted or dynamically attached Unix domain sockets (`register_boxlet_sandbox`). EdgeGate authenticates the workload (supporting zero-downtime dual-token rollover via `secondary_token` / `secondary_token_sha256`), evaluates a default-deny multi-tenant RBAC and request-attribute policy (`required_headers`, `forbidden_query_params`, per-rule `max_body_bytes`, and Egress DLP `blocked_body_substrings`), strips forged/hop-by-hop headers, injects the scoped, TTL-checked upstream secret (`expires_at_epoch_s`, live-rotatable via `EdgeGateProxy::rotate_secret` or `/_edgegate/admin/secrets/rotate`) on the wire, negotiates outbound Mutual TLS (mTLS) via pool-scoped `client_cert_pem` / `client_key_pem` (`INV-18`), hardens responses via `strip_response_headers` / `inject_response_headers`, and optionally guards responses against accidental or malicious upstream secret reflection (`block_secret_reflection = true`).
+2. **Fail-Closed L7 Security Pipeline:** Every request passes through a linear, strongly-typed security pipeline that enforces pre-policy path normalization (`400`), constant-time SHA-256 primary/secondary token verification (`401`), multi-tenant RBAC, L7 attribute/MCP tool policy, & forbidden query-parameter filtering (`403`, `INV-15`, `INV-17`), per-rule and server-wide request payload size ceilings (`413`, `INV-17`), synchronous Egress DLP request payload inspection (`blocked_body_substrings` -> `403`, `INV-19`), per-workload token-bucket rate limiting (`429`), scoped credential TTL expiry enforcement (`403`, `INV-14`), resolve-validate-connect SSRF protection across IPv4/IPv6/mapped-IPv6 (`403`), outbound mTLS client authentication (`INV-18`), zero `3xx` redirect following, response credential reflection blocking (`502`), programmable response header stripping & injection, and a cryptographic SHA-256 hash-chained tamper-evident audit ledger (`INV-16`).
+3. **Production-Grade Resilience, Control Plane & Observability:** Features inbound TLS 1.2/1.3 termination (`[server.tls]`, ALPN `h2` & `http/1.1`), outbound TLS 1.2/1.3 & mTLS (`client_cert_pem` / `client_key_pem`), single-flight HTTP/1.1 connection pooling with RAII EOF-drain guards (`PooledBody`), multiplexed HTTP/2 (`h2` TLS ALPN & `h2c`), four load-balancing algorithms (`RoundRobin`, `LeastConnections`, `ConsistentHash`, `LatencyAware` EWMA) with weighted canary traffic splitting (`weight` on `[[pools.backends]]`), three-state circuit breakers (`Closed` -> `Open` -> `HalfOpen` single-flight probe), controlled idempotent-only failover retries (`max_idempotent_retries`), graceful in-flight connection draining (`drain_timeout_ms`), atomic zero-downtime hot reload (`ArcSwap`), an authenticated Admin Control Plane API (`/_edgegate/admin/reload`, `/_edgegate/admin/secrets/rotate`, `/_edgegate/admin/audit`, `/_edgegate/admin/pools` guarded by constant-time `X-EdgeGate-Admin-Token`), lock-free Prometheus microsecond latency histograms (`edgegate_request_duration_microseconds_bucket`), W3C `traceparent` propagation, live traffic shadowing, a sanitized flight-recorder replay buffer (`/_edgegate/replay`), and operator inspection CLI subcommands (`edgegate status`, `edgegate replay`, `edgegate audit`).
 
 ---
 
@@ -26,7 +26,7 @@ EdgeGate solves this at the systems layer:
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │ Untrusted AI Agent / Ephemeral Sandbox (Docker internal:true or Boxlet MicroVM)  │
-│  • Zero upstream API keys in env, disk, or memory                                │
+│  • Zero upstream API keys or mTLS private keys in env, disk, or memory           │
 │  • Zero default route to the public internet                                     │
 └───────────────────┬──────────────────────────────────────────┬───────────────────┘
                     │ Zero-Token UDS Socket                    │ TCP / Inbound TLS (h2/http1.1)
@@ -35,9 +35,9 @@ EdgeGate solves this at the systems layer:
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                              EdgeGate L7 Data Plane                              ║
 ║                                                                                  ║
-║  0. Admin Control Plane & Obs. ──► /_edgegate/admin/{reload,secrets/rotate,audit}║
-║                                    (Constant-time X-EdgeGate-Admin-Token,        ║
-║                                     fail-closed when unconfigured)               ║
+║  0. Admin Control Plane & Obs. ──► /_edgegate/admin/{reload,secrets/rotate,      ║
+║                                    audit,pools} (Constant-time Admin Token,      ║
+║                                    fail-closed when unconfigured)                ║
 ║  1. Pre-Policy Path Validator  ──► Rejects .., %2e, %2f, %5c, \, %00, // (400)   ║
 ║  2. Workload Authenticator     ──► UDS Identity or Dual-Token SHA-256 (401)      ║
 ║  3. Deterministic L7 Router    ──► Longest-prefix + Host matching (403 on miss)  ║
@@ -45,23 +45,25 @@ EdgeGate solves this at the systems layer:
 ║                                    required_headers, forbidden_query_params,     ║
 ║                                    per-rule max_body_bytes ceiling) (403 / 413)  ║
 ║  5. Token-Bucket Rate Limiter  ──► Per-workload RPS & burst enforcement (429)    ║
-║  6. Load Balancer & Breaker    ──► Weighted RR | LeastConn | ConsistentHash |    ║
+║  6. Egress DLP Payload Guard   ──► Scans bounded body for blocked_body_substrings║
+║                                    before upstream dispatch (403, INV-19)        ║
+║  7. Load Balancer & Breaker    ──► Weighted RR | LeastConn | ConsistentHash |    ║
 ║                                    EWMA + 3-State Breaker + Idempotent Failover  ║
-║  7. Header Sanitizer & Secrets ──► Strips hop-by-hop & forged auth; enforces     ║
+║  8. Header Sanitizer & Secrets ──► Strips hop-by-hop & forged auth; enforces     ║
 ║                                    TTL (expires_at_epoch_s) & injects scoped     ║
 ║                                    (org_id, cred_ref) + W3C traceparent          ║
-║  8. Connection Pool & SSRF     ──► Resolve-validate-connect IPv4/IPv6/mapped-v6  ║
-║                                    HTTP/1.1 PooledBody guard & HTTP/2 (h2/h2c)   ║
-║  9. Response Reflection Guard  ──► Scans headers/body when block_secret_reflection║
-║                                    is enabled; blocks leaked secrets with 502    ║
-║ 10. Tamper-Evident Audit Chain ──► SHA-256 prev_hash -> entry_hash ledger        ║
+║  9. Connection Pool, mTLS/SSRF ──► Resolve-validate-connect IPv4/IPv6/mapped-v6  ║
+║                                    Outbound TLS/mTLS (INV-18), HTTP/1.1 & HTTP/2 ║
+║ 10. Response Guard & Hardening ──► Blocks secret reflection (502); applies       ║
+║                                    strip_response_headers & inject_response_hdrs ║
+║ 11. Tamper-Evident Audit Chain ──► SHA-256 prev_hash -> entry_hash ledger        ║
 ║                                    (INV-16) + Lock-Free Latency Histograms       ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
                     │ Primary Dispatch                         │ Async Non-Blocking Mirror
                     ▼                                          ▼
      ┌─────────────────────────────┐            ┌─────────────────────────────┐
      │   Primary Upstream Pool     │            │   Optional Shadow Pool      │
-     │ (HTTP/1.1, HTTP/2, rustls)  │            │ (Canary Status Diffing &    │
+     │ (HTTP/1.1, HTTP/2, mTLS)    │            │ (Canary Status Diffing &    │
      └─────────────────────────────┘            │  Flight-Recorder Capture)   │
                                                 └─────────────────────────────┘
 ```
@@ -70,7 +72,7 @@ For a deep dive into the internal state machines, connection pool invariants, an
 
 ---
 
-## Capabilities Matrix (Milestones 1–7 / `v0.7.0`)
+## Capabilities Matrix (Milestones 1–8 / `v0.8.0`)
 
 | Milestone | Subsystem | Key Capabilities |
 |---|---|---|
@@ -81,6 +83,7 @@ For a deep dive into the internal state machines, connection pool invariants, an
 | **Milestone 5 (`v0.5.0`)** | **Inbound TLS, Secret Reflection Guard, Idempotent Failover & Graceful Drain** | • Inbound `rustls` TLS 1.2/1.3 termination (`[server.tls]`, inline `cert_pem`/`key_pem` or `cert_path`/`key_path`) with automatic ALPN `h2` & `http/1.1` negotiation<br>• Defense-in-depth Response Credential Reflection Guard (`block_secret_reflection = true` on `[routes.credential]`) blocking upstream responses that reflect injected secrets (`502 Bad Gateway`, `secret_reflections_blocked_total` + `/_edgegate/replay` audit entry)<br>• Controlled idempotent failover retries (`max_idempotent_retries` on `[[pools]]`, `retries_total`) retrying only safe methods (`GET`, `HEAD`, `OPTIONS`) on connect/transport errors against the next healthy backend while never retrying state-mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`)<br>• Graceful in-flight connection draining (`drain_timeout_ms` on `[server]`, `in_flight_requests` gauge) waiting for active streams to complete on shutdown |
 | **Milestone 6 (`v0.6.0`)** | **Scoped Credential Rotation & TTL Expiry, Request-Attribute Policies, Dual-Token Rollover & Operator CLI** | • Scoped Credential Rotation & TTL Expiry (`INV-14`): `expires_at_epoch_s` on `[[secrets]]` fails closed (`403 Forbidden`) when a credential expires, and `EdgeGateProxy::rotate_secret` rotates credentials live in-memory without a full config reload (`secret_rotations_total` metric)<br>• Programmable Request-Attribute Policy Matching (`INV-15`): `required_headers` on `[[policies]]` (e.g., `required_headers = { "x-mcp-tool" = "github.read_repo" }`) enables fine-grained L7 attribute and MCP tool-call enforcement alongside Keelway MCP Gateway and IoRa<br>• Zero-Downtime Dual Workload Token Rollover: `secondary_token` / `secondary_token_sha256` on `[[workloads]]` allows seamless workload token rotation without dropping active requests<br>• Live Security Console Demo (`cargo run --example security_console_demo`) & Operator Inspection CLI (`edgegate status`, `edgegate replay`) |
 | **Milestone 7 (`v0.7.0`)** | **Authenticated Admin Control Plane API, SHA-256 Tamper-Evident Audit Ledger, Weighted Canary LB, Query/Payload Resource Limits & Latency Histograms** | • Authenticated Admin Control Plane API (`/_edgegate/admin/reload`, `/_edgegate/admin/secrets/rotate`, `/_edgegate/admin/audit`): constant-time `X-EdgeGate-Admin-Token` authentication (`server.admin_token` / `server.admin_token_sha256`), disabled fail-closed when unconfigured<br>• Cryptographic SHA-256 Hash-Chained Tamper-Evident Audit Ledger (`INV-16`): `prev_hash` -> `entry_hash` SHA-256 chain over every gateway decision, verified at `/_edgegate/admin/audit` and exported via `audit_chain_valid` in `/_edgegate/metrics`<br>• Weighted Canary Load Balancing (`weight` on `[[pools.backends]]`): configurable backend weights for proportional canary traffic splitting<br>• Per-Rule Query-Parameter & Payload Resource Limits (`INV-17`, `forbidden_query_params`, `max_body_bytes`): blocks forbidden query parameters (`403 Forbidden`) and enforces per-rule request body size ceilings (`413 Payload Too Large`)<br>• Prometheus Latency Histograms (`edgegate_request_duration_microseconds_bucket`): lock-free microsecond histogram buckets (`100us`, `500us`, `1000us`, `5000us`, `10000us`, `50000us`, `+Inf`) exported on `/_edgegate/metrics?format=prometheus` |
+| **Milestone 8 (`v0.8.0`)** | **Outbound mTLS Client Auth, Egress DLP Payload Guard, Programmable Response Header Hardening & Admin Pool Introspection** | • Outbound Mutual TLS (mTLS) Client Authentication (`INV-18`): per-pool `client_cert_pem` + `client_key_pem` validated via `rustls` / `rustls-pemfile` so EdgeGate presents client certificates during upstream TLS 1.2/1.3 handshakes with zero private keys in the sandbox<br>• Egress Data Loss Prevention (DLP) Payload Guard (`INV-19`): per-rule `blocked_body_substrings` inspecting bounded outbound request bodies before upstream dispatch, rejecting exfiltration attempts fail-closed with `403 Forbidden`, incrementing `dlp_blocked_total` (`edgegate_dlp_blocked_total`), and recording sanitized `dlp_payload_blocked` replay entries<br>• Programmable Response Header Stripping & Security Header Injection: route-level `strip_response_headers` and `inject_response_headers` to scrub upstream server fingerprinting headers and enforce security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control`)<br>• Admin Pool & Circuit-Breaker Topology Introspection (`GET /_edgegate/admin/pools`) & CLI `edgegate audit`: live authenticated inspection of per-pool strategy, mTLS status, backend weights, active health, EWMA latency, and 3-state circuit breakers (`closed`, `open`, `half_open`), plus the `edgegate audit` CLI subcommand |
 
 ---
 
@@ -132,6 +135,10 @@ max_idempotent_retries = 1         # Retries safe methods (GET/HEAD/OPTIONS) on 
 allow_private_ip = false           # Keep false in production to enforce full IPv4/IPv6/mapped-v6 SSRF blocklist
 health_check_path = "/healthz"     # Optional background active HTTP health probe path
 health_check_interval_ms = 5000
+# Optional outbound Mutual TLS (mTLS) client certificate & private key (INV-18, Milestone 8).
+# Must be specified together; validated at config compile time via rustls.
+# client_cert_pem = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+# client_key_pem = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 backends = [
   { id = "gh-stable", address = "api.github.com:443", tls = true, tls_sni = "api.github.com", http2 = true, weight = 9 },
   { id = "gh-canary", address = "api.github.com:443", tls = true, tls_sni = "api.github.com", http2 = true, weight = 1 },
@@ -152,6 +159,8 @@ host = "gateway.internal"          # Optional Host header constraint
 strip_prefix = true                # Rewrites /v1/github/repos/foo -> /repos/foo
 pool = "github-primary"
 shadow_pool = "github-canary"      # Optional non-blocking async traffic mirroring & status diffing
+strip_response_headers = ["server", "x-powered-by"] # Optional upstream response header scrubbing (Milestone 8)
+inject_response_headers = { "x-content-type-options" = "nosniff", "x-frame-options" = "DENY", "cache-control" = "no-store" } # Optional security header injection (Milestone 8)
 [routes.credential]
 credential_ref = "github_pat"
 header_name = "Authorization"      # Unconditionally stripped from incoming request before injection
@@ -168,6 +177,7 @@ path_prefix = "/v1/github/repos"   # Segment-boundary-safe prefix check
 required_headers = { "x-mcp-tool" = "github.read_repo" } # Optional L7 attribute / MCP tool-call enforcement (Milestone 6)
 forbidden_query_params = ["debug", "raw_token"]          # Blocks requests containing forbidden query parameters with 403 (Milestone 7)
 max_body_bytes = 65536             # Optional per-rule payload ceiling in bytes; returns 413 on overflow (Milestone 7)
+blocked_body_substrings = ["-----BEGIN PRIVATE KEY-----", "AKIA"] # Optional Egress DLP payload guard; blocks with 403 (INV-19, Milestone 8)
 rate_limit_rps = 100               # Optional token-bucket refill rate (requests/sec)
 rate_limit_burst = 200             # Optional token-bucket burst capacity
 
@@ -195,10 +205,13 @@ cargo run -- status --url http://127.0.0.1:8080
 # 4. Inspect the sanitized flight-recorder replay buffer via the Operator CLI
 cargo run -- replay --url http://127.0.0.1:8080
 
-# 5. Run the interactive 5-scenario zero-secret security console demo
+# 5. Inspect and verify the cryptographic SHA-256 hash-chained audit ledger via the Operator CLI
+cargo run -- audit --url http://127.0.0.1:8080 --admin-token "$EDGEGATE_ADMIN_TOKEN"
+
+# 6. Run the interactive 5-scenario zero-secret security console demo
 cargo run --example security_console_demo
 
-# 6. Run the full unit, integration, and adversarial security test suite
+# 7. Run the full unit, integration, and adversarial security test suite
 cargo test --all-targets
 ```
 
@@ -222,12 +235,13 @@ EdgeGate exposes built-in, zero-secret diagnostic endpoints and an authenticated
 | Endpoint | Format | Description |
 |---|---|---|
 | `GET /_edgegate/healthz` | `application/json` | Returns liveness and active atomic `ArcSwap` configuration generation (`{"status":"ok","config_generation":1}`). |
-| `GET /_edgegate/metrics` | `application/json` | Exposes lock-free atomic counters, gauges, and tamper-evident audit chain health: `allowed_total`, `blocked_total`, `rate_limited_total`, `upstream_errors_total`, `retries_total`, `secret_reflections_blocked_total`, `secret_rotations_total`, `in_flight_requests`, `reloads_total`, `reload_failures_total`, `config_generation`, `shadow_requests_total`, `shadow_mismatches_total`, and `audit_chain_valid`. |
-| `GET /_edgegate/metrics?format=prometheus` | `text/plain; version=0.0.4` | Exposes all EdgeGate telemetry counters, gauges (`edgegate_audit_chain_valid`), and lock-free microsecond request latency histogram buckets (`edgegate_request_duration_microseconds_bucket` across `100us`, `500us`, `1000us`, `5000us`, `10000us`, `50000us`, `+Inf`) in standard Prometheus text exposition format. |
-| `GET /_edgegate/replay` | `application/json` | Returns the bounded flight-recorder ring buffer of recent `5xx`/`502`/`503`/`504` upstream failures, `secret_reflection_blocked` events, and `shadow_status_mismatch` events (strictly sanitized: zero headers, bodies, or credentials). |
+| `GET /_edgegate/metrics` | `application/json` | Exposes lock-free atomic counters, gauges, and tamper-evident audit chain health: `allowed_total`, `blocked_total`, `dlp_blocked_total`, `rate_limited_total`, `upstream_errors_total`, `retries_total`, `secret_reflections_blocked_total`, `secret_rotations_total`, `in_flight_requests`, `reloads_total`, `reload_failures_total`, `config_generation`, `shadow_requests_total`, `shadow_mismatches_total`, and `audit_chain_valid`. |
+| `GET /_edgegate/metrics?format=prometheus` | `text/plain; version=0.0.4` | Exposes all EdgeGate telemetry counters (`edgegate_dlp_blocked_total`, etc.), gauges (`edgegate_audit_chain_valid`), and lock-free microsecond request latency histogram buckets (`edgegate_request_duration_microseconds_bucket` across `100us`, `500us`, `1000us`, `5000us`, `10000us`, `50000us`, `+Inf`) in standard Prometheus text exposition format. |
+| `GET /_edgegate/replay` | `application/json` | Returns the bounded flight-recorder ring buffer of recent `5xx`/`502`/`503`/`504` upstream failures, `secret_reflection_blocked` events, `dlp_payload_blocked` events, and `shadow_status_mismatch` events (strictly sanitized: zero headers, bodies, or credentials). |
 | `POST /_edgegate/admin/reload` | `application/json` | Requires constant-time `X-EdgeGate-Admin-Token`. Atomically compiles and swaps a new TOML configuration payload without dropping in-flight connections (`403`/`401` when unconfigured or invalid token). |
 | `POST /_edgegate/admin/secrets/rotate` | `application/json` | Requires constant-time `X-EdgeGate-Admin-Token`. Rotates a scoped `(org_id, credential_ref)` secret and optional `expires_at_epoch_s` TTL live in-memory (`secret_rotations_total`). |
 | `GET /_edgegate/admin/audit` | `application/json` | Requires constant-time `X-EdgeGate-Admin-Token`. Returns the cryptographic SHA-256 hash-chained tamper-evident audit ledger (`prev_hash` -> `entry_hash` over every gateway decision, `INV-16`) along with full chain verification status. |
+| `GET /_edgegate/admin/pools` | `application/json` | Requires constant-time `X-EdgeGate-Admin-Token`. Returns live pool and backend topology snapshots (`strategy`, `mtls_enabled`, per-backend `weight`, `active_healthy`, `circuit_state` (`closed`/`open`/`half_open`), `active_connections`, and `ewma_latency_us`). |
 
 ---
 
@@ -271,6 +285,8 @@ Reproducible localhost HTTP/1.1 keep-alive benchmark ([`examples/bench.rs`](file
   - [**ADR-001:** Explicit L7 Reverse-Proxy Gateway Architecture](docs/adr/001-explicit-l7-gateway-architecture.md)
   - [**ADR-002:** Outbound TLS, Atomic Hot Reload, Zero-Token UDS Identity, RBAC & Active Health Probes](docs/adr/002-milestone-2-tls-hot-reload-uds-and-rbac.md)
   - [**ADR-003:** HTTP/2, Three-State Circuit Breakers, Consistent/Latency-Aware LB, Traffic Shadowing & Boxlet UDS](docs/adr/003-milestone-3-http2-circuit-breakers-shadowing-and-boxlet.md)
+  - [**ADR-007:** Authenticated Admin Control Plane API, SHA-256 Tamper-Evident Audit Ledger, Weighted Canary LB, Query/Payload Resource Guards & Latency Histograms](docs/adr/007-milestone-7-admin-control-plane-hash-chained-audit-and-weighted-canary.md)
+  - [**ADR-008:** Outbound Mutual TLS (mTLS) Client Authentication, Egress DLP Payload Guard, Programmable Response Header Hardening & Admin Pool Introspection](docs/adr/008-milestone-8-outbound-mtls-egress-dlp-response-hardening-and-pool-introspection.md)
 
 ## License
 
