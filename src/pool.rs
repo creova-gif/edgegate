@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -205,7 +206,12 @@ impl ConnectionPool {
         for (pool_name, pool) in compiled {
             for backend in &pool.backends {
                 let tls_connector = if backend.tls {
-                    build_tls_connector(&pool.custom_ca_certs, backend.http2)
+                    build_tls_connector(
+                        &pool.custom_ca_certs,
+                        &pool.client_cert_chain,
+                        pool.client_key_pem.as_deref(),
+                        backend.http2,
+                    )
                 } else {
                     None
                 };
@@ -563,6 +569,8 @@ impl ConnectionPool {
 
 fn build_tls_connector(
     custom_ca_certs: &[CertificateDer<'static>],
+    client_cert_chain: &[CertificateDer<'static>],
+    client_key_pem: Option<&str>,
     enable_h2_alpn: bool,
 ) -> Option<TlsConnector> {
     let mut root_store = RootCertStore::empty();
@@ -573,11 +581,20 @@ fn build_tls_connector(
         }
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .ok()?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_root_certificates(root_store);
+    let mut config = match client_key_pem {
+        Some(key_pem) if !client_cert_chain.is_empty() => {
+            let mut reader = Cursor::new(key_pem.as_bytes());
+            let key_der = rustls_pemfile::private_key(&mut reader).ok().flatten()?;
+            builder
+                .with_client_auth_cert(client_cert_chain.to_vec(), key_der)
+                .ok()?
+        }
+        _ => builder.with_no_client_auth(),
+    };
     if enable_h2_alpn {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }

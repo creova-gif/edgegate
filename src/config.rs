@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{HeaderName, Method};
+use http::{HeaderName, HeaderValue, Method};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
 use serde::Deserialize;
@@ -116,6 +116,12 @@ pub struct PoolConfig {
     /// Optional custom CA certificate PEM bundle for outbound TLS verification on this pool.
     #[serde(default)]
     pub ca_cert_pem: Option<String>,
+    /// Optional client certificate PEM chain for outbound mTLS authentication (`Milestone 8`).
+    #[serde(default)]
+    pub client_cert_pem: Option<String>,
+    /// Optional client private key PEM for outbound mTLS authentication (`Milestone 8`).
+    #[serde(default)]
+    pub client_key_pem: Option<String>,
     /// Optional active HTTP health probe path (e.g. `"/healthz"`).
     #[serde(default)]
     pub health_check_path: Option<String>,
@@ -167,6 +173,12 @@ pub struct RouteConfig {
     /// Optional shadow upstream pool for asynchronous live traffic mirroring & status diffing (`Milestone 3`).
     #[serde(default)]
     pub shadow_pool: Option<String>,
+    /// Optional response header names to strip before returning responses to workloads (`Milestone 8`).
+    #[serde(default)]
+    pub strip_response_headers: Vec<String>,
+    /// Optional response headers to inject on responses returned to workloads (`Milestone 8`).
+    #[serde(default)]
+    pub inject_response_headers: HashMap<String, String>,
     /// Optional scoped credential injection binding.
     #[serde(default)]
     pub credential: Option<CredentialBindingConfig>,
@@ -204,6 +216,9 @@ pub struct PolicyRuleConfig {
     /// Optional forbidden query parameter keys blocked on this rule (`Milestone 7`).
     #[serde(default)]
     pub forbidden_query_params: Vec<String>,
+    /// Optional egress DLP payload substrings blocked on outbound request bodies (`Milestone 8`).
+    #[serde(default)]
+    pub blocked_body_substrings: Vec<String>,
     /// Optional per-rule request body size limit in bytes (`Milestone 7`; must be `> 0` if `Some`).
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
@@ -326,6 +341,8 @@ pub struct CompiledPool {
     pub passive_cooldown: Duration,
     pub allow_private_ip: bool,
     pub custom_ca_certs: Vec<CertificateDer<'static>>,
+    pub client_cert_chain: Vec<CertificateDer<'static>>,
+    pub client_key_pem: Option<String>,
     pub health_check_path: Option<String>,
     pub health_check_interval: Duration,
     pub max_idempotent_retries: u32,
@@ -351,6 +368,8 @@ pub struct CompiledRoute {
     pub strip_prefix: bool,
     pub pool: String,
     pub shadow_pool: Option<String>,
+    pub strip_response_headers: Vec<HeaderName>,
+    pub inject_response_headers: Vec<(HeaderName, HeaderValue)>,
     pub credential: Option<CompiledCredentialBinding>,
 }
 
@@ -372,6 +391,7 @@ pub struct CompiledPolicyRule {
     pub path_prefix: String,
     pub required_headers: HashMap<String, String>,
     pub forbidden_query_params: Vec<String>,
+    pub blocked_body_substrings: Vec<String>,
     pub max_body_bytes: Option<usize>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
@@ -587,6 +607,48 @@ impl CompiledConfig {
                 None => Vec::new(),
             };
 
+            let (client_cert_chain, client_key_pem) = match (p.client_cert_pem, p.client_key_pem) {
+                (Some(cert_pem), Some(key_pem)) => {
+                    let certs = parse_pem_certs(&cert_pem).map_err(|msg| {
+                        EdgeGateError::Config(format!(
+                            "pool '{}' invalid client_cert_pem: {msg}",
+                            p.name
+                        ))
+                    })?;
+                    let key_der = parse_pem_private_key(&key_pem).map_err(|msg| {
+                        EdgeGateError::Config(format!(
+                            "pool '{}' invalid client_key_pem: {msg}",
+                            p.name
+                        ))
+                    })?;
+                    let provider = Arc::new(rustls::crypto::ring::default_provider());
+                    rustls::ClientConfig::builder_with_provider(provider)
+                        .with_safe_default_protocol_versions()
+                        .map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "pool '{}' TLS version config error: {e}",
+                                p.name
+                            ))
+                        })?
+                        .with_root_certificates(rustls::RootCertStore::empty())
+                        .with_client_auth_cert(certs.clone(), key_der)
+                        .map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "pool '{}' mismatched client_cert_pem / client_key_pem: {e}",
+                                p.name
+                            ))
+                        })?;
+                    (certs, Some(key_pem))
+                }
+                (None, None) => (Vec::new(), None),
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(EdgeGateError::Config(format!(
+                        "pool '{}' must set both client_cert_pem and client_key_pem for outbound mTLS",
+                        p.name
+                    )));
+                }
+            };
+
             let mut compiled_backends = Vec::with_capacity(p.backends.len());
             let mut seen_ids = HashSet::new();
             for b in p.backends {
@@ -640,6 +702,8 @@ impl CompiledConfig {
                         passive_cooldown: Duration::from_millis(p.passive_cooldown_ms),
                         allow_private_ip: p.allow_private_ip,
                         custom_ca_certs,
+                        client_cert_chain,
+                        client_key_pem,
                         health_check_path: p.health_check_path,
                         health_check_interval: Duration::from_millis(
                             p.health_check_interval_ms.max(100),
@@ -685,6 +749,47 @@ impl CompiledConfig {
                     )));
                 }
             }
+            let mut strip_response_headers = Vec::with_capacity(r.strip_response_headers.len());
+            for raw_hdr in r.strip_response_headers {
+                let trimmed = raw_hdr.trim();
+                if trimmed.is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "route '{}' has empty strip_response_headers entry",
+                        r.id
+                    )));
+                }
+                let hdr_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|e| {
+                    EdgeGateError::Config(format!(
+                        "route '{}' invalid strip_response_headers name '{raw_hdr}': {e}",
+                        r.id
+                    ))
+                })?;
+                strip_response_headers.push(hdr_name);
+            }
+            let mut inject_response_headers = Vec::with_capacity(r.inject_response_headers.len());
+            for (raw_name, raw_val) in r.inject_response_headers {
+                let trimmed = raw_name.trim();
+                if trimmed.is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "route '{}' has empty inject_response_headers key",
+                        r.id
+                    )));
+                }
+                let hdr_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|e| {
+                    EdgeGateError::Config(format!(
+                        "route '{}' invalid inject_response_headers key '{raw_name}': {e}",
+                        r.id
+                    ))
+                })?;
+                let hdr_val = HeaderValue::from_str(&raw_val).map_err(|e| {
+                    EdgeGateError::Config(format!(
+                        "route '{}' invalid inject_response_headers value for '{raw_name}': {e}",
+                        r.id
+                    ))
+                })?;
+                inject_response_headers.push((hdr_name, hdr_val));
+            }
+            inject_response_headers.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
             let credential = match r.credential {
                 Some(c) => {
                     if c.credential_ref.trim().is_empty() {
@@ -717,6 +822,8 @@ impl CompiledConfig {
                 strip_prefix: r.strip_prefix,
                 pool: r.pool,
                 shadow_pool: r.shadow_pool,
+                strip_response_headers,
+                inject_response_headers,
                 credential,
             });
         }
@@ -776,6 +883,16 @@ impl CompiledConfig {
                 }
                 forbidden_query_params.push(lower_param);
             }
+            let mut blocked_body_substrings = Vec::with_capacity(pol.blocked_body_substrings.len());
+            for pat in pol.blocked_body_substrings {
+                if pat.trim().is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "policy for route '{}' has empty blocked_body_substrings entry",
+                        pol.route_id
+                    )));
+                }
+                blocked_body_substrings.push(pat);
+            }
             let mut methods = HashSet::with_capacity(pol.methods.len());
             for m in pol.methods {
                 let parsed =
@@ -810,6 +927,7 @@ impl CompiledConfig {
                 path_prefix: pol.path_prefix,
                 required_headers,
                 forbidden_query_params,
+                blocked_body_substrings,
                 max_body_bytes: pol.max_body_bytes,
                 rate_limit_rps: pol.rate_limit_rps,
                 rate_limit_burst: pol.rate_limit_burst,

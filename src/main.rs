@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use edgegate::config::CompiledConfig;
-use edgegate::proxy::EdgeGateProxy;
+use edgegate::proxy::{EdgeGateProxy, ADMIN_TOKEN_HEADER};
 use edgegate::telemetry::init_json_logging;
 use http::header::HOST;
 use http::{Request, Uri};
@@ -52,9 +52,25 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
     },
+    /// Fetch and verify the cryptographic SHA-256 hash-chained audit ledger (`/_edgegate/admin/audit`).
+    Audit {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        /// Admin control-plane token sent via X-EdgeGate-Admin-Token.
+        #[arg(long)]
+        admin_token: String,
+    },
 }
 
 async fn fetch_endpoint(base_url: &str, endpoint_path: &str) -> Result<String, String> {
+    fetch_endpoint_with_header(base_url, endpoint_path, None).await
+}
+
+async fn fetch_endpoint_with_header(
+    base_url: &str,
+    endpoint_path: &str,
+    extra_header: Option<(&str, &str)>,
+) -> Result<String, String> {
     let trimmed = base_url.trim_end_matches('/');
     let full_url = format!("{trimmed}{endpoint_path}");
     let uri: Uri = full_url
@@ -81,10 +97,14 @@ async fn fetch_endpoint(base_url: &str, endpoint_path: &str) -> Result<String, S
         let _ = conn.await;
     });
 
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("GET")
         .uri(path_and_query)
-        .header(HOST, &authority)
+        .header(HOST, &authority);
+    if let Some((hdr_name, hdr_val)) = extra_header {
+        builder = builder.header(hdr_name, hdr_val);
+    }
+    let req = builder
         .body(Full::new(Bytes::new()))
         .map_err(|e| format!("failed to build request: {e}"))?;
 
@@ -150,6 +170,24 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Audit { url, admin_token } => {
+            match fetch_endpoint_with_header(
+                &url,
+                "/_edgegate/admin/audit",
+                Some((ADMIN_TOKEN_HEADER, admin_token.as_str())),
+            )
+            .await
+            {
+                Ok(body) => {
+                    println!("{body}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    error!(error = %err, "edgegate_audit_error");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Start {
             config,
             watch_interval_ms,

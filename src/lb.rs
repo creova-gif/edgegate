@@ -75,6 +75,10 @@ pub trait LoadBalancer: Send + Sync {
     fn record_failure(&self, pool_name: &str, backend_id: &str);
     /// Updates active health status from background HTTP health probes.
     fn set_active_health(&self, pool_name: &str, backend_id: &str, healthy: bool);
+    /// Serializes live per-pool strategy, backend health, weights, EWMA latency, and circuit-breaker state (`Milestone 8`).
+    fn pools_status_json(&self) -> String {
+        "{\"pools\":[]}".to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -177,6 +181,7 @@ impl BackendState {
 struct PoolState {
     name: String,
     strategy: LbStrategyConfig,
+    mtls_enabled: bool,
     allow_private_ip: bool,
     passive_failure_threshold: u32,
     passive_cooldown: Duration,
@@ -221,6 +226,8 @@ impl PoolLoadBalancer {
                 PoolState {
                     name: pool.name.clone(),
                     strategy: pool.strategy,
+                    mtls_enabled: !pool.client_cert_chain.is_empty()
+                        && pool.client_key_pem.is_some(),
                     allow_private_ip: pool.allow_private_ip,
                     passive_failure_threshold: pool.passive_failure_threshold,
                     passive_cooldown: pool.passive_cooldown,
@@ -360,6 +367,66 @@ impl LoadBalancer for PoolLoadBalancer {
             }
         }
     }
+
+    fn pools_status_json(&self) -> String {
+        let now = Instant::now();
+        let mut names: Vec<&String> = self.pools.keys().collect();
+        names.sort();
+        let mut pool_items = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(pool) = self.pools.get(name) else {
+                continue;
+            };
+            let strategy_str = match pool.strategy {
+                LbStrategyConfig::RoundRobin => "round_robin",
+                LbStrategyConfig::LeastConnections => "least_connections",
+                LbStrategyConfig::ConsistentHash => "consistent_hash",
+                LbStrategyConfig::LatencyAware => "latency_aware",
+            };
+            let mut backend_items = Vec::with_capacity(pool.backends.len());
+            for b in &pool.backends {
+                let circuit_state = {
+                    let guard = match b.circuit.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    match *guard {
+                        CircuitState::Closed { .. } => "closed",
+                        CircuitState::Open { until } => {
+                            if now >= until {
+                                "half_open"
+                            } else {
+                                "open"
+                            }
+                        }
+                        CircuitState::HalfOpen { .. } => "half_open",
+                    }
+                };
+                backend_items.push(format!(
+                    "{{\"id\":\"{}\",\"authority\":\"{}\",\"weight\":{},\"active_healthy\":{},\"in_flight\":{},\"ewma_latency_us\":{},\"circuit_state\":\"{}\"}}",
+                    escape_lb_json(&b.config.id),
+                    escape_lb_json(&b.config.authority),
+                    b.config.weight,
+                    b.active_healthy.load(Ordering::Acquire),
+                    b.in_flight.load(Ordering::Acquire),
+                    b.ewma_latency_us.load(Ordering::Relaxed),
+                    circuit_state
+                ));
+            }
+            pool_items.push(format!(
+                "{{\"name\":\"{}\",\"strategy\":\"{}\",\"mtls_enabled\":{},\"backends\":[{}]}}",
+                escape_lb_json(&pool.name),
+                strategy_str,
+                pool.mtls_enabled,
+                backend_items.join(",")
+            ));
+        }
+        format!("{{\"pools\":[{}]}}", pool_items.join(","))
+    }
+}
+
+fn escape_lb_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn release_half_open_probe(circuit: &Mutex<CircuitState>) {
@@ -434,6 +501,8 @@ mod tests {
                 passive_cooldown: Duration::from_millis(cooldown_ms),
                 allow_private_ip: true,
                 custom_ca_certs: Vec::new(),
+                client_cert_chain: Vec::new(),
+                client_key_pem: None,
                 health_check_path: None,
                 health_check_interval: Duration::from_secs(5),
                 max_idempotent_retries: 0,
