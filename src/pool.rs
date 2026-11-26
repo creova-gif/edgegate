@@ -48,6 +48,7 @@ pub struct UpstreamSlotConfigKey {
     pub client_key_pem: Option<String>,
     pub ca_fingerprint: [u8; 32],
     pub client_cert_fingerprint: [u8; 32],
+    pub allow_private_ip: bool,
 }
 
 fn compute_cert_fingerprint(certs: &[CertificateDer<'static>]) -> [u8; 32] {
@@ -296,6 +297,7 @@ impl ConnectionPool {
                     client_key_pem: pool.client_key_pem.clone(),
                     ca_fingerprint,
                     client_cert_fingerprint,
+                    allow_private_ip: pool.allow_private_ip,
                 };
 
                 if let Some(prev_slot) = previous.and_then(|p| p.slots.get(&slot_key)) {
@@ -618,8 +620,8 @@ impl ConnectionPool {
         let key = (backend.host.clone(), backend.port, allow_private_ip);
         {
             let snap = self.dns_cache.load();
-            if let Some((addrs, expires_at)) = snap.get(&key) {
-                if Instant::now() < *expires_at {
+            if let Some((addrs, resolved_at)) = snap.get(&key) {
+                if Instant::now().saturating_duration_since(*resolved_at) < dns_cache_ttl {
                     return Ok(addrs.clone());
                 }
             }
@@ -627,15 +629,26 @@ impl ConnectionPool {
 
         let resolved =
             resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
-        let expires_at = Instant::now() + dns_cache_ttl;
+        let resolved_at = Instant::now();
         let resolved_clone = resolved.clone();
         self.dns_cache.rcu(move |current| {
             let mut next = (**current).clone();
             if next.len() > 256 {
                 let now = Instant::now();
-                next.retain(|_, (_, exp)| *exp > now);
+                next.retain(|_, (_, res_at)| {
+                    now.saturating_duration_since(*res_at) < Duration::from_secs(60)
+                });
+                if next.len() > 256 {
+                    if let Some(oldest_key) = next
+                        .iter()
+                        .min_by_key(|(_, (_, res_at))| *res_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        next.remove(&oldest_key);
+                    }
+                }
             }
-            next.insert(key.clone(), (resolved_clone.clone(), expires_at));
+            next.insert(key.clone(), (resolved_clone.clone(), resolved_at));
             next
         });
 
@@ -1025,14 +1038,17 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
-        let past = Instant::now() - Duration::from_secs(10);
-        let future = Instant::now() + Duration::from_secs(60);
+        let past = Instant::now() - Duration::from_secs(70);
+        let fresh = Instant::now();
 
         pool.dns_cache.rcu(|current| {
             let mut next = (**current).clone();
             for i in 0..260 {
-                let exp = if i < 100 { past } else { future };
-                next.insert((format!("host-{i}.internal"), 80, true), (vec![], exp));
+                let resolved_at = if i < 100 { past } else { fresh };
+                next.insert(
+                    (format!("host-{i}.internal"), 80, true),
+                    (vec![], resolved_at),
+                );
             }
             next
         });
@@ -1055,7 +1071,62 @@ mod tests {
             .await
             .unwrap();
         assert!(!addrs.is_empty());
-        // Since len was > 256, expired entries (100 of them) were evicted!
+        // Since len was > 256, expired entries older than 60s (100 of them) were evicted!
         assert!(pool.dns_cache.load().len() < 200);
+    }
+
+    #[test]
+    fn does_not_reuse_slot_when_allow_private_ip_changes() {
+        use crate::config::LbStrategyConfig;
+
+        let mut pools1 = HashMap::new();
+        pools1.insert(
+            "p1".to_string(),
+            CompiledPool {
+                name: "p1".to_string(),
+                strategy: LbStrategyConfig::RoundRobin,
+                backends: vec![CompiledBackend {
+                    id: "b1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 8080,
+                    authority: "127.0.0.1:8080".to_string(),
+                    weight: 1,
+                    tls: false,
+                    tls_sni: "127.0.0.1".to_string(),
+                    http2: false,
+                }],
+                max_connections_per_upstream: 16,
+                idle_ttl: Duration::from_secs(30),
+                passive_failure_threshold: 3,
+                passive_cooldown: Duration::from_secs(5),
+                allow_private_ip: true,
+                custom_ca_certs: Vec::new(),
+                client_cert_chain: Vec::new(),
+                client_key_pem: None,
+                health_check_path: None,
+                health_check_interval: Duration::from_secs(5),
+                max_idempotent_retries: 0,
+                dns_cache_ttl: Duration::from_secs(10),
+            },
+        );
+
+        let pool1 =
+            ConnectionPool::from_pools(&pools1, Duration::from_secs(2), Duration::from_secs(5));
+
+        let mut pools2 = pools1.clone();
+        pools2.get_mut("p1").unwrap().allow_private_ip = false;
+
+        let pool2 = ConnectionPool::from_pools_reusing(
+            &pools2,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Some(&pool1),
+        );
+
+        let key = ("p1".to_string(), "b1".to_string());
+        assert!(!Arc::ptr_eq(
+            &pool1.slots.get(&key).unwrap().semaphore,
+            &pool2.slots.get(&key).unwrap().semaphore
+        ));
     }
 }

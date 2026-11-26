@@ -1184,3 +1184,217 @@ admin_token = "adm-obs-secret"
     assert_eq!(s_r_ok, StatusCode::OK);
     assert!(b_r_ok.contains("\"records\":"));
 }
+
+#[tokio::test]
+async fn secret_rotation_preserves_json_special_chars_and_reload_disabling_private_ip_evicts_warm_pool(
+) {
+    let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_clone = Arc::clone(&captured_auth);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("bind up: {e}"));
+    let up_addr = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("up addr: {e}"));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let captured_inner = Arc::clone(&captured_clone);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let captured_deep = Arc::clone(&captured_inner);
+                    async move {
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        *captured_deep.lock().unwrap() = auth;
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                            b"upstream-ok",
+                        ))))
+                    }
+                });
+                let _ = server_http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+
+    let toml_initial = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+admin_token = "adm-sec-rotate"
+
+[[workloads]]
+workload_id = "test-workload"
+org_id = "org-special"
+token = "tok-special"
+
+[[pools]]
+name = "special-pool"
+allow_private_ip = true
+backends = [
+  {{ id = "b1", address = "{up_addr}" }}
+]
+
+[[routes]]
+id = "special-route"
+path_prefix = "/v1/special"
+strip_prefix = true
+pool = "special-pool"
+
+[routes.credential]
+credential_ref = "rot_key"
+header_name = "Authorization"
+value_prefix = "Bearer "
+
+[[policies]]
+org_id = "org-special"
+route_id = "special-route"
+methods = ["GET"]
+path_prefix = "/v1/special"
+
+[[secrets]]
+org_id = "org-special"
+credential_ref = "rot_key"
+value = "initial_secret"
+"#
+    );
+
+    let compiled =
+        CompiledConfig::from_toml_str(&toml_initial).unwrap_or_else(|e| panic!("compile: {e}"));
+    let gw_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("bind gw: {e}"));
+    let gw_addr = gw_listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("gw addr: {e}"));
+    let proxy = Arc::new(EdgeGateProxy::new(compiled));
+    let runner = Arc::clone(&proxy);
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = runner.serve(gw_listener, rx).await;
+    });
+
+    // 1. Initial request establishes a warm keep-alive connection to 127.0.0.1:<port>
+    let req1 = Request::builder()
+        .method("GET")
+        .uri("/v1/special/ping")
+        .header("host", "edgegate.local")
+        .header("x-edgegate-token", "tok-special")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (s1, _, b1) = send_http1(gw_addr, req1).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(b1, "upstream-ok");
+    assert_eq!(
+        captured_auth.lock().unwrap().as_deref(),
+        Some("Bearer initial_secret")
+    );
+
+    // 2. Rotate secret via JSON POST /_edgegate/admin/secrets/rotate with value "sec_prefix\":suffix\\quote"
+    let rotate_json = r#"{"org_id":"org-special","credential_ref":"rot_key","value":"sec_prefix\":suffix\\quote"}"#;
+    let rotate_req = Request::builder()
+        .method("POST")
+        .uri("/_edgegate/admin/secrets/rotate")
+        .header("host", "edgegate.local")
+        .header("x-edgegate-admin-token", "adm-sec-rotate")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(rotate_json)))
+        .unwrap();
+    let (s_rot, _, b_rot) = send_http1(gw_addr, rotate_req).await;
+    assert_eq!(
+        s_rot,
+        StatusCode::OK,
+        "secret rotation must succeed: {b_rot}"
+    );
+    assert!(b_rot.contains("\"status\":\"rotated\""));
+
+    // Verify subsequent request injects the EXACT verbatim string "Bearer sec_prefix\":suffix\\quote" upstream
+    let req2 = Request::builder()
+        .method("GET")
+        .uri("/v1/special/ping2")
+        .header("host", "edgegate.local")
+        .header("x-edgegate-token", "tok-special")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (s2, _, b2) = send_http1(gw_addr, req2).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b2, "upstream-ok");
+    assert_eq!(
+        captured_auth.lock().unwrap().as_deref(),
+        Some("Bearer sec_prefix\":suffix\\quote"),
+        "injected Authorization header must preserve verbatim special characters without corruption"
+    );
+
+    // 3. Reload pool from allow_private_ip = true to allow_private_ip = false
+    let toml_disallow_private = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+admin_token = "adm-sec-rotate"
+
+[[workloads]]
+workload_id = "test-workload"
+org_id = "org-special"
+token = "tok-special"
+
+[[pools]]
+name = "special-pool"
+allow_private_ip = false
+backends = [
+  {{ id = "b1", address = "{up_addr}" }}
+]
+
+[[routes]]
+id = "special-route"
+path_prefix = "/v1/special"
+strip_prefix = true
+pool = "special-pool"
+
+[routes.credential]
+credential_ref = "rot_key"
+header_name = "Authorization"
+value_prefix = "Bearer "
+
+[[policies]]
+org_id = "org-special"
+route_id = "special-route"
+methods = ["GET"]
+path_prefix = "/v1/special"
+
+[[secrets]]
+org_id = "org-special"
+credential_ref = "rot_key"
+value = "initial_secret"
+"#
+    );
+
+    let reload_res = proxy.reload_from_toml_str(&toml_disallow_private);
+    assert!(
+        reload_res.is_ok(),
+        "hot reload disabling private IP must succeed: {:?}",
+        reload_res.err()
+    );
+
+    // 4. Request through the pool must evict the warm slot and reject subsequent request with 403 Forbidden (SSRF guard)
+    let req3 = Request::builder()
+        .method("GET")
+        .uri("/v1/special/ping3")
+        .header("host", "edgegate.local")
+        .header("x-edgegate-token", "tok-special")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (s3, _, _) = send_http1(gw_addr, req3).await;
+    assert_eq!(
+        s3,
+        StatusCode::FORBIDDEN,
+        "request after hot-reloading allow_private_ip=false must be rejected with 403 Forbidden by SSRF guard"
+    );
+}

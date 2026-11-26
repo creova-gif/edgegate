@@ -479,16 +479,15 @@ Modern AI agent workbenches and MCP developer frontends (e.g., browser-based LLM
 - **Declarative Route CORS Configuration:** Routes (`[[routes]]`) support optional `[routes.cors]`:
   ```toml
   [routes.cors]
-  allow_origins = ["https://console.internal", "https://agent.example.com"]
-  allow_methods = ["GET", "POST", "OPTIONS"]
-  allow_headers = ["Authorization", "Content-Type", "X-EdgeGate-Token", "X-MCP-Tool"]
+  allowed_origins = ["https://console.internal", "https://agent.example.com"]
+  allowed_methods = ["GET", "POST", "OPTIONS"]
+  allowed_headers = ["Authorization", "Content-Type", "X-EdgeGate-Token", "X-MCP-Tool"]
   expose_headers = ["X-EdgeGate-Timestamp", "X-EdgeGate-Signature-256"]
-  allow_credentials = true
-  max_age_s = 86400
+  max_age_secs = 86400
   ```
-- **Wildcard Rejection on Credentials:** Configuration validation forbids specifying wildcard origin `allow_origins = ["*"]` when `allow_credentials = true`, preventing credential exposure attacks.
+- **Wildcard Rejection on Origins:** Configuration validation strictly forbids empty origins or wildcard origin `allowed_origins = ["*"]`, preventing credential and data exposure attacks.
 - **Zero-Secret Preflight Short-Circuiting:** Arriving `OPTIONS` requests matching a configured CORS route are evaluated at the routing layer before authentication, policy evaluation, or backend pool checkout. Preflight requests from authorized origins receive immediate `204 No Content` responses containing standard CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, `Access-Control-Max-Age: <seconds>`) and `Vary: Origin`, executing in microseconds without allocating upstream sockets or injecting credentials.
-- **Outbound Actual Request Headers:** On non-preflight requests, EdgeGate attaches matching CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials`, `Access-Control-Expose-Headers`, and `Vary: Origin`) to the downstream response.
+- **Outbound Actual Request Headers:** On non-preflight requests, EdgeGate attaches matching CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Expose-Headers`, and `Vary: Origin`) to the downstream response.
 
 ### W3C `tracestate` Distributed Tracing Interoperability (`src/router.rs`)
 While W3C `traceparent` (`INV-04`) provides core trace-id and span-id propagation, enterprise distributed tracing systems (OpenTelemetry, Jaeger, Datadog, AWS X-Ray) use the W3C `tracestate` header to propagate vendor-specific contextual state across service boundaries:

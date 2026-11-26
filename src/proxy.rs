@@ -27,7 +27,9 @@ use subtle::ConstantTimeEq;
 use crate::auth::{
     HeaderTokenAuthenticator, TransportBoundAuthenticator, WorkloadAuthenticator, WorkloadIdentity,
 };
-use crate::config::{sha256_digest, CompiledConfig, CompiledCorsConfig, CompiledWorkload};
+use crate::config::{
+    sha256_digest, CompiledAwsSigV4, CompiledConfig, CompiledCorsConfig, CompiledWorkload,
+};
 use crate::lb::{LoadBalancer, PoolLoadBalancer};
 use crate::policy::{DefaultDenyPolicyEngine, PolicyDecision, PolicyEngine};
 use crate::pool::ConnectionPool;
@@ -735,6 +737,11 @@ impl EdgeGateProxy {
             );
         }
 
+        let pre_matched_cors = snap
+            .router
+            .match_route(&path, host_header.as_deref())
+            .and_then(|r| r.cors.clone());
+
         // CORS OPTIONS Preflight Short-Circuit (Before Step 2 Workload Auth, INV-27).
         if method == Method::OPTIONS
             && req_headers.contains_key(ORIGIN)
@@ -794,7 +801,7 @@ impl EdgeGateProxy {
                             }
                         }
                     }
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         "-",
@@ -806,6 +813,8 @@ impl EdgeGateProxy {
                             "CORS origin not allowed by route policy".to_string(),
                         ),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             }
@@ -816,16 +825,36 @@ impl EdgeGateProxy {
             Some(ta) => match ta.authenticate(&req_headers) {
                 Ok(id) => id,
                 Err(err) => {
-                    return self.finish_error(
-                        req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
+                    return self.finish_error_with_cors(
+                        req_id,
+                        &trace_id,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "BLOCKED",
+                        err,
+                        started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             },
             None => match snap.auth.authenticate(&req_headers) {
                 Ok(id) => id,
                 Err(err) => {
-                    return self.finish_error(
-                        req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
+                    return self.finish_error_with_cors(
+                        req_id,
+                        &trace_id,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "BLOCKED",
+                        err,
+                        started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             },
@@ -862,7 +891,7 @@ impl EdgeGateProxy {
                         reason: "workload_bulkhead_rejected".to_string(),
                         latency_us: started.elapsed().as_micros() as u64,
                     });
-                    let mut resp = self.finish_error(
+                    let mut resp = self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -874,6 +903,8 @@ impl EdgeGateProxy {
                             "workload concurrency quota exceeded".to_string(),
                         ),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                     resp.headers_mut()
                         .insert(RETRY_AFTER, HeaderValue::from_static("1"));
@@ -891,7 +922,7 @@ impl EdgeGateProxy {
         let route = match snap.router.match_route(&path, host_header.as_deref()) {
             Some(r) => r.clone(),
             None => {
-                return self.finish_error(
+                return self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -901,6 +932,8 @@ impl EdgeGateProxy {
                     "BLOCKED",
                     EdgeGateError::Forbidden(format!("default-deny: no route matches '{path}'")),
                     started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
                 );
             }
         };
@@ -909,7 +942,7 @@ impl EdgeGateProxy {
         if let Some(ref cors) = route.cors {
             if let Some(ref orig) = origin_header {
                 if !cors.allowed_origins.contains(orig) {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -921,6 +954,8 @@ impl EdgeGateProxy {
                             "CORS origin not allowed by route policy".to_string(),
                         ),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             }
@@ -946,7 +981,7 @@ impl EdgeGateProxy {
                     allowed_jsonrpc_methods,
                 ),
                 PolicyDecision::Deny { reason } => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -956,6 +991,8 @@ impl EdgeGateProxy {
                         "BLOCKED",
                         EdgeGateError::Forbidden(reason),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
                 PolicyDecision::RateLimited { reason } => {
@@ -973,7 +1010,7 @@ impl EdgeGateProxy {
                         reason: "rate_limited".to_string(),
                         latency_us: started.elapsed().as_micros() as u64,
                     });
-                    let mut resp = self.finish_error(
+                    let mut resp = self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -983,6 +1020,8 @@ impl EdgeGateProxy {
                         "RATE_LIMITED",
                         EdgeGateError::TooManyRequests(reason),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                     resp.headers_mut()
                         .insert(RETRY_AFTER, HeaderValue::from_static("1"));
@@ -995,7 +1034,7 @@ impl EdgeGateProxy {
         let collected = match Limited::new(req.into_body(), max_body).collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => {
-                return self.finish_error(
+                return self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1007,6 +1046,8 @@ impl EdgeGateProxy {
                         "request body exceeds limit of {max_body} bytes"
                     )),
                     started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
                 );
             }
         };
@@ -1032,7 +1073,7 @@ impl EdgeGateProxy {
                 reason: "dlp_payload_blocked".to_string(),
                 latency_us,
             });
-            return self.finish_error(
+            return self.finish_error_with_cors(
                 req_id,
                 &trace_id,
                 &identity.org_id,
@@ -1044,6 +1085,8 @@ impl EdgeGateProxy {
                     "egress DLP blocked forbidden payload pattern '{matched_pat}'"
                 )),
                 started,
+                pre_matched_cors.as_ref(),
+                origin_header.as_deref(),
             );
         }
 
@@ -1088,7 +1131,7 @@ impl EdgeGateProxy {
                     reason: "jsonrpc_method_blocked".to_string(),
                     latency_us,
                 });
-                return self.finish_error(
+                return self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1100,6 +1143,8 @@ impl EdgeGateProxy {
                         "JSON-RPC/MCP method not allowed by policy".to_string(),
                     ),
                     started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
                 );
             }
         }
@@ -1123,7 +1168,7 @@ impl EdgeGateProxy {
                     reason: "circuit_open_or_all_backends_unhealthy".to_string(),
                     latency_us: started.elapsed().as_micros() as u64,
                 });
-                return self.finish_error(
+                return self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1133,6 +1178,8 @@ impl EdgeGateProxy {
                     "ERROR",
                     err,
                     started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
                 );
             }
         };
@@ -1146,7 +1193,7 @@ impl EdgeGateProxy {
             match sanitize_outbound_headers(&req_headers, &backend_authority, target_cred_header) {
                 Ok(h) => h,
                 Err(err) => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -1156,6 +1203,8 @@ impl EdgeGateProxy {
                         "ERROR",
                         err,
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             };
@@ -1174,7 +1223,7 @@ impl EdgeGateProxy {
             {
                 Ok(s) => s,
                 Err(err) => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -1184,6 +1233,8 @@ impl EdgeGateProxy {
                         "BLOCKED",
                         err,
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             };
@@ -1191,7 +1242,7 @@ impl EdgeGateProxy {
             let header_val = match HeaderValue::from_str(&injected_str) {
                 Ok(v) => v,
                 Err(_) => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -1201,6 +1252,8 @@ impl EdgeGateProxy {
                         "ERROR",
                         EdgeGateError::Internal("invalid credential header value".to_string()),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             };
@@ -1219,7 +1272,7 @@ impl EdgeGateProxy {
             {
                 Ok(s) => s,
                 Err(err) => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -1229,6 +1282,8 @@ impl EdgeGateProxy {
                         "BLOCKED",
                         err,
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             };
@@ -1254,7 +1309,7 @@ impl EdgeGateProxy {
         let upstream_uri = match Uri::builder().path_and_query(upstream_pq.as_str()).build() {
             Ok(u) => u,
             Err(err) => {
-                return self.finish_error(
+                return self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1264,87 +1319,46 @@ impl EdgeGateProxy {
                     "ERROR",
                     EdgeGateError::BadRequest(format!("invalid rewritten URI: {err}")),
                     started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
                 );
             }
         };
 
         if let Some(ref sigv4) = route.aws_sigv4 {
             outbound_headers.remove(http::header::AUTHORIZATION);
-            outbound_headers.remove("x-amz-date");
-            outbound_headers.remove("x-amz-content-sha256");
-            outbound_headers.remove("x-amz-security-token");
+            let amz_keys: Vec<HeaderName> = outbound_headers
+                .keys()
+                .filter(|k| k.as_str().starts_with("x-amz-"))
+                .cloned()
+                .collect();
+            for k in amz_keys {
+                outbound_headers.remove(&k);
+            }
 
-            let access_key = match snap
-                .secrets
-                .get_secret(&identity.org_id, &sigv4.access_key_ref)
-            {
-                Ok(k) => k,
-                Err(err) => {
-                    return self.finish_error(
-                        req_id,
-                        &trace_id,
-                        &identity.org_id,
-                        &identity.workload_id,
-                        &route.id,
-                        &backend_id,
-                        "BLOCKED",
-                        err,
-                        started,
-                    );
-                }
-            };
-            let secret_key = match snap
-                .secrets
-                .get_secret(&identity.org_id, &sigv4.secret_key_ref)
-            {
-                Ok(k) => k,
-                Err(err) => {
-                    return self.finish_error(
-                        req_id,
-                        &trace_id,
-                        &identity.org_id,
-                        &identity.workload_id,
-                        &route.id,
-                        &backend_id,
-                        "BLOCKED",
-                        err,
-                        started,
-                    );
-                }
-            };
-
-            let unix_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => d.as_secs(),
-                Err(_) => 0,
-            };
-            let (amz_date, date_stamp) = crate::config::format_amz_timestamps(unix_s);
-            let (canon_path, canon_query) = match upstream_pq.split_once('?') {
-                Some((p, q)) => (p, Some(q)),
-                None => (upstream_pq.as_str(), None),
-            };
-
-            let sig_headers = crate::config::compute_aws_sigv4_headers(
-                access_key.expose(),
-                secret_key.expose(),
-                &sigv4.region,
-                &sigv4.service,
+            if let Err(err) = apply_aws_sigv4_headers(
+                &snap,
+                &identity.org_id,
+                sigv4,
                 method.as_str(),
-                canon_path,
-                canon_query,
+                &upstream_pq,
                 &backend_authority,
                 &collected,
-                &amz_date,
-                &date_stamp,
-            );
-
-            if let Ok(val) = HeaderValue::from_str(&sig_headers.amz_date) {
-                outbound_headers.insert(HeaderName::from_static("x-amz-date"), val);
-            }
-            if let Ok(val) = HeaderValue::from_str(&sig_headers.content_sha256) {
-                outbound_headers.insert(HeaderName::from_static("x-amz-content-sha256"), val);
-            }
-            if let Ok(val) = HeaderValue::from_str(&sig_headers.authorization) {
-                outbound_headers.insert(http::header::AUTHORIZATION, val);
+                &mut outbound_headers,
+            ) {
+                return self.finish_error_with_cors(
+                    req_id,
+                    &trace_id,
+                    &identity.org_id,
+                    &identity.workload_id,
+                    &route.id,
+                    &backend_id,
+                    "BLOCKED",
+                    err,
+                    started,
+                    pre_matched_cors.as_ref(),
+                    origin_header.as_deref(),
+                );
             }
             self.telemetry.record_signed_request();
         }
@@ -1369,7 +1383,7 @@ impl EdgeGateProxy {
             {
                 Ok(r) => r,
                 Err(err) => {
-                    return self.finish_error(
+                    return self.finish_error_with_cors(
                         req_id,
                         &trace_id,
                         &identity.org_id,
@@ -1379,6 +1393,8 @@ impl EdgeGateProxy {
                         "ERROR",
                         EdgeGateError::Internal(format!("failed to build upstream request: {err}")),
                         started,
+                        pre_matched_cors.as_ref(),
+                        origin_header.as_deref(),
                     );
                 }
             };
@@ -1404,46 +1420,29 @@ impl EdgeGateProxy {
                         outbound_headers.insert(HOST, host_val);
                     }
                     if let Some(ref sigv4) = route.aws_sigv4 {
-                        let (canon_path, canon_query) = match upstream_pq.split_once('?') {
-                            Some((p, q)) => (p, Some(q)),
-                            None => (upstream_pq.as_str(), None),
-                        };
-                        let unix_s = match std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                        {
-                            Ok(d) => d.as_secs(),
-                            Err(_) => 0,
-                        };
-                        let (amz_date, date_stamp) = crate::config::format_amz_timestamps(unix_s);
-                        if let (Ok(ak), Ok(sk)) = (
-                            snap.secrets
-                                .get_secret(&identity.org_id, &sigv4.access_key_ref),
-                            snap.secrets
-                                .get_secret(&identity.org_id, &sigv4.secret_key_ref),
+                        if let Err(secret_err) = apply_aws_sigv4_headers(
+                            &snap,
+                            &identity.org_id,
+                            sigv4,
+                            method.as_str(),
+                            &upstream_pq,
+                            &next_lease.backend.authority,
+                            &collected,
+                            &mut outbound_headers,
                         ) {
-                            let sig_headers = crate::config::compute_aws_sigv4_headers(
-                                ak.expose(),
-                                sk.expose(),
-                                &sigv4.region,
-                                &sigv4.service,
-                                method.as_str(),
-                                canon_path,
-                                canon_query,
-                                &next_lease.backend.authority,
-                                &collected,
-                                &amz_date,
-                                &date_stamp,
+                            return self.finish_error_with_cors(
+                                req_id,
+                                &trace_id,
+                                &identity.org_id,
+                                &identity.workload_id,
+                                &route.id,
+                                &backend_id,
+                                "BLOCKED",
+                                secret_err,
+                                started,
+                                pre_matched_cors.as_ref(),
+                                origin_header.as_deref(),
                             );
-                            if let Ok(val) = HeaderValue::from_str(&sig_headers.amz_date) {
-                                outbound_headers.insert(HeaderName::from_static("x-amz-date"), val);
-                            }
-                            if let Ok(val) = HeaderValue::from_str(&sig_headers.content_sha256) {
-                                outbound_headers
-                                    .insert(HeaderName::from_static("x-amz-content-sha256"), val);
-                            }
-                            if let Ok(val) = HeaderValue::from_str(&sig_headers.authorization) {
-                                outbound_headers.insert(http::header::AUTHORIZATION, val);
-                            }
                         }
                     }
                     lease = next_lease;
@@ -1479,7 +1478,7 @@ impl EdgeGateProxy {
                             reason: "credential_reflection_blocked".to_string(),
                             latency_us,
                         });
-                        return self.finish_error(
+                        return self.finish_error_with_cors(
                             req_id,
                             &trace_id,
                             &identity.org_id,
@@ -1491,6 +1490,8 @@ impl EdgeGateProxy {
                                 "upstream credential reflection blocked".to_string(),
                             ),
                             started,
+                            pre_matched_cors.as_ref(),
+                            origin_header.as_deref(),
                         );
                     }
                 }
@@ -1532,7 +1533,7 @@ impl EdgeGateProxy {
                                         reason: "response_body_too_large".to_string(),
                                         latency_us,
                                     });
-                                    return self.finish_error(
+                                    return self.finish_error_with_cors(
                                         req_id,
                                         &trace_id,
                                         &identity.org_id,
@@ -1545,6 +1546,8 @@ impl EdgeGateProxy {
                                                 .to_string(),
                                         ),
                                         started,
+                                        pre_matched_cors.as_ref(),
+                                        origin_header.as_deref(),
                                     );
                                 } else {
                                     snap.lb.record_failure(&pool_name, &backend_id);
@@ -1562,7 +1565,7 @@ impl EdgeGateProxy {
                                         reason: "upstream_transport_or_timeout".to_string(),
                                         latency_us,
                                     });
-                                    return self.finish_error(
+                                    return self.finish_error_with_cors(
                                         req_id,
                                         &trace_id,
                                         &identity.org_id,
@@ -1574,6 +1577,8 @@ impl EdgeGateProxy {
                                             "failed to read upstream response body: {box_err}"
                                         )),
                                         started,
+                                        pre_matched_cors.as_ref(),
+                                        origin_header.as_deref(),
                                     );
                                 }
                             }
@@ -1602,7 +1607,7 @@ impl EdgeGateProxy {
                                     reason: "upstream_transport_or_timeout".to_string(),
                                     latency_us,
                                 });
-                                return self.finish_error(
+                                return self.finish_error_with_cors(
                                     req_id,
                                     &trace_id,
                                     &identity.org_id,
@@ -1614,6 +1619,8 @@ impl EdgeGateProxy {
                                         "failed to read upstream response body: {err}"
                                     )),
                                     started,
+                                    pre_matched_cors.as_ref(),
+                                    origin_header.as_deref(),
                                 );
                             }
                         }
@@ -1646,7 +1653,7 @@ impl EdgeGateProxy {
                                 reason: "credential_reflection_blocked".to_string(),
                                 latency_us,
                             });
-                            return self.finish_error(
+                            return self.finish_error_with_cors(
                                 req_id,
                                 &trace_id,
                                 &identity.org_id,
@@ -1658,6 +1665,8 @@ impl EdgeGateProxy {
                                     "upstream credential reflection blocked".to_string(),
                                 ),
                                 started,
+                                pre_matched_cors.as_ref(),
+                                origin_header.as_deref(),
                             );
                         }
                     }
@@ -1708,6 +1717,8 @@ impl EdgeGateProxy {
                         route.id.clone(),
                         shadow_pool_name.clone(),
                         upstream_uri,
+                        upstream_pq.clone(),
+                        route.aws_sigv4.clone(),
                         outbound_headers,
                         collected,
                         status.as_u16(),
@@ -1737,12 +1748,9 @@ impl EdgeGateProxy {
                         .headers
                         .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
                 }
-                attach_cors_headers(
-                    &mut parts.headers,
-                    route.cors.as_ref(),
-                    origin_header.as_deref(),
-                    raw_origin_header.as_deref(),
-                );
+                if let Some(ref cors) = route.cors {
+                    attach_cors_headers(&mut parts.headers, cors, origin_header.as_deref());
+                }
                 let body = if !route.strip_response_headers.is_empty() {
                     let strip_headers = route.strip_response_headers.clone();
                     body.map_frame(move |mut frame| {
@@ -1792,7 +1800,7 @@ impl EdgeGateProxy {
                 } else {
                     "ERROR"
                 };
-                self.finish_error_cors(
+                self.finish_error_with_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1804,7 +1812,6 @@ impl EdgeGateProxy {
                     started,
                     route.cors.as_ref(),
                     origin_header.as_deref(),
-                    raw_origin_header.as_deref(),
                 )
             }
         }
@@ -1823,6 +1830,8 @@ impl EdgeGateProxy {
         route_id: String,
         shadow_pool_name: String,
         upstream_uri: Uri,
+        upstream_pq: String,
+        aws_sigv4: Option<CompiledAwsSigV4>,
         mut headers: HeaderMap,
         body_bytes: Bytes,
         primary_status: u16,
@@ -1837,6 +1846,22 @@ impl EdgeGateProxy {
             let shadow_backend_id = shadow_lease.backend.id.clone();
             if let Ok(host_val) = HeaderValue::from_str(&shadow_lease.backend.authority) {
                 headers.insert(HOST, host_val);
+            }
+            if let Some(ref sigv4) = aws_sigv4 {
+                if apply_aws_sigv4_headers(
+                    &snap,
+                    &org_id,
+                    sigv4,
+                    method.as_str(),
+                    &upstream_pq,
+                    &shadow_lease.backend.authority,
+                    &body_bytes,
+                    &mut headers,
+                )
+                .is_err()
+                {
+                    return;
+                }
             }
             let Ok(mut shadow_req) = Request::builder()
                 .method(method.clone())
@@ -1905,7 +1930,7 @@ impl EdgeGateProxy {
         err: EdgeGateError,
         started: Instant,
     ) -> Response<ProxyBody> {
-        self.finish_error_cors(
+        self.finish_error_with_cors(
             request_id,
             trace_id,
             org_id,
@@ -1917,12 +1942,11 @@ impl EdgeGateProxy {
             started,
             None,
             None,
-            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn finish_error_cors(
+    fn finish_error_with_cors(
         &self,
         request_id: u64,
         trace_id: &str,
@@ -1934,8 +1958,7 @@ impl EdgeGateProxy {
         err: EdgeGateError,
         started: Instant,
         cors: Option<&CompiledCorsConfig>,
-        origin: Option<&str>,
-        raw_origin: Option<&str>,
+        origin_header: Option<&str>,
     ) -> Response<ProxyBody> {
         let status = err.status_code();
         let latency_us = started.elapsed().as_micros() as u64;
@@ -1955,36 +1978,83 @@ impl EdgeGateProxy {
             resp.headers_mut()
                 .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
         }
-        attach_cors_headers(resp.headers_mut(), cors, origin, raw_origin);
+        if let Some(cors) = cors {
+            attach_cors_headers(resp.headers_mut(), cors, origin_header);
+        }
         resp
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_aws_sigv4_headers(
+    snap: &RuntimeSnapshot,
+    org_id: &str,
+    sigv4: &CompiledAwsSigV4,
+    method_str: &str,
+    upstream_pq: &str,
+    authority: &str,
+    payload: &[u8],
+    headers: &mut HeaderMap,
+) -> Result<(), EdgeGateError> {
+    let access_key = snap.secrets.get_secret(org_id, &sigv4.access_key_ref)?;
+    let secret_key = snap.secrets.get_secret(org_id, &sigv4.secret_key_ref)?;
+
+    let unix_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => 0,
+    };
+    let (amz_date, date_stamp) = crate::config::format_amz_timestamps(unix_s);
+    let (canon_path, canon_query) = match upstream_pq.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (upstream_pq, None),
+    };
+
+    let sig_headers = crate::config::compute_aws_sigv4_headers(
+        access_key.expose(),
+        secret_key.expose(),
+        &sigv4.region,
+        &sigv4.service,
+        method_str,
+        canon_path,
+        canon_query,
+        authority,
+        payload,
+        &amz_date,
+        &date_stamp,
+    );
+
+    if let Ok(val) = HeaderValue::from_str(&sig_headers.amz_date) {
+        headers.insert(HeaderName::from_static("x-amz-date"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&sig_headers.content_sha256) {
+        headers.insert(HeaderName::from_static("x-amz-content-sha256"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&sig_headers.authorization) {
+        headers.insert(http::header::AUTHORIZATION, val);
+    }
+
+    Ok(())
+}
+
 fn attach_cors_headers(
     headers: &mut HeaderMap,
-    cors: Option<&CompiledCorsConfig>,
-    origin: Option<&str>,
-    raw_origin: Option<&str>,
+    cors: &CompiledCorsConfig,
+    origin_header: Option<&str>,
 ) {
-    if let (Some(cors), Some(orig)) = (cors, origin) {
+    let has_origin_vary = headers
+        .get_all(http::header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|tok| tok.trim().eq_ignore_ascii_case("origin") || tok.trim() == "*");
+    if !has_origin_vary {
+        headers.append(http::header::VARY, HeaderValue::from_static("Origin"));
+    }
+
+    if let Some(orig) = origin_header {
         if cors.allowed_origins.contains(orig) {
-            let orig_str = raw_origin.unwrap_or(orig);
-            if let Ok(val) = HeaderValue::from_str(orig_str) {
+            if let Ok(val) = HeaderValue::from_str(orig) {
                 headers.insert(HeaderName::from_static("access-control-allow-origin"), val);
-                if let Some(existing_vary) = headers.get(http::header::VARY) {
-                    if let Ok(existing_str) = existing_vary.to_str() {
-                        if !existing_str.to_ascii_lowercase().contains("origin") {
-                            let combined = format!("{existing_str}, Origin");
-                            if let Ok(v) = HeaderValue::from_str(&combined) {
-                                headers.insert(http::header::VARY, v);
-                            }
-                        }
-                    } else {
-                        headers.insert(http::header::VARY, HeaderValue::from_static("Origin"));
-                    }
-                } else {
-                    headers.insert(http::header::VARY, HeaderValue::from_static("Origin"));
-                }
                 if let Some(ref exp) = cors.expose_headers_value {
                     headers.insert(
                         HeaderName::from_static("access-control-expose-headers"),
@@ -2023,17 +2093,10 @@ fn verify_admin_token(snap: &RuntimeSnapshot, headers: &HeaderMap) -> Result<(),
 }
 
 fn parse_rotate_secret_request(body_str: &str) -> Result<RotateSecretRequest, String> {
-    if let Ok(req) = toml::from_str::<RotateSecretRequest>(body_str) {
+    if let Ok(req) = serde_json::from_str::<RotateSecretRequest>(body_str) {
         return Ok(req);
     }
-    let normalized = body_str.replace("\":", "\" =");
-    #[derive(Deserialize)]
-    struct WrappedRotate {
-        req: RotateSecretRequest,
-    }
-    toml::from_str::<WrappedRotate>(&format!("req = {normalized}"))
-        .map(|w| w.req)
-        .map_err(|e| e.to_string())
+    toml::from_str::<RotateSecretRequest>(body_str).map_err(|e| e.to_string())
 }
 
 fn json_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {

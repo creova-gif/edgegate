@@ -49,6 +49,9 @@ enum Command {
     Status {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
+        /// Admin control-plane token (falls back to EDGEGATE_ADMIN_TOKEN environment variable).
+        #[arg(long)]
+        admin_token: Option<String>,
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
@@ -58,11 +61,17 @@ enum Command {
         /// Optional client private key PEM file for outbound mTLS client authentication.
         #[arg(long)]
         client_key: Option<PathBuf>,
+        /// Allow sending admin token over cleartext HTTP to non-loopback hosts.
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
     /// Fetch live flight-recorder replay records (`/_edgegate/replay`) from a running EdgeGate instance.
     Replay {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
+        /// Admin control-plane token (falls back to EDGEGATE_ADMIN_TOKEN environment variable).
+        #[arg(long)]
+        admin_token: Option<String>,
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
@@ -72,6 +81,9 @@ enum Command {
         /// Optional client private key PEM file for outbound mTLS client authentication.
         #[arg(long)]
         client_key: Option<PathBuf>,
+        /// Allow sending admin token over cleartext HTTP to non-loopback hosts.
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
     /// Fetch and verify the cryptographic SHA-256 hash-chained audit ledger (`/_edgegate/admin/audit`).
     Audit {
@@ -95,6 +107,7 @@ enum Command {
     },
 }
 
+#[allow(dead_code)]
 async fn fetch_endpoint(
     base_url: &str,
     endpoint_path: &str,
@@ -289,13 +302,45 @@ async fn main() -> ExitCode {
         },
         Command::Status {
             url,
+            admin_token,
             ca_cert,
             client_cert,
             client_key,
+            allow_insecure_http,
         } => {
-            match fetch_endpoint(
+            let opt_token = admin_token
+                .or_else(|| std::env::var("EDGEGATE_ADMIN_TOKEN").ok())
+                .filter(|t| !t.trim().is_empty());
+
+            let header = if let Some(ref tok) = opt_token {
+                let uri: Uri = match url.parse() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(error = %e, "invalid status URL");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let scheme = uri.scheme_str().unwrap_or("http");
+                let host = uri.host().unwrap_or_default();
+                let is_loopback = is_loopback_host(host);
+                if (scheme == "http" || uri.scheme().is_none())
+                    && !allow_insecure_http
+                    && !is_loopback
+                {
+                    error!(
+                        "refusing to send admin token over cleartext http:// to non-loopback host (use https:// or pass --allow-insecure-http)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Some((ADMIN_TOKEN_HEADER, tok.as_str()))
+            } else {
+                None
+            };
+
+            match fetch_endpoint_with_header(
                 &url,
                 "/_edgegate/metrics",
+                header,
                 ca_cert.as_deref(),
                 client_cert.as_deref(),
                 client_key.as_deref(),
@@ -314,13 +359,45 @@ async fn main() -> ExitCode {
         }
         Command::Replay {
             url,
+            admin_token,
             ca_cert,
             client_cert,
             client_key,
+            allow_insecure_http,
         } => {
-            match fetch_endpoint(
+            let opt_token = admin_token
+                .or_else(|| std::env::var("EDGEGATE_ADMIN_TOKEN").ok())
+                .filter(|t| !t.trim().is_empty());
+
+            let header = if let Some(ref tok) = opt_token {
+                let uri: Uri = match url.parse() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(error = %e, "invalid replay URL");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let scheme = uri.scheme_str().unwrap_or("http");
+                let host = uri.host().unwrap_or_default();
+                let is_loopback = is_loopback_host(host);
+                if (scheme == "http" || uri.scheme().is_none())
+                    && !allow_insecure_http
+                    && !is_loopback
+                {
+                    error!(
+                        "refusing to send admin token over cleartext http:// to non-loopback host (use https:// or pass --allow-insecure-http)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Some((ADMIN_TOKEN_HEADER, tok.as_str()))
+            } else {
+                None
+            };
+
+            match fetch_endpoint_with_header(
                 &url,
                 "/_edgegate/replay",
+                header,
                 ca_cert.as_deref(),
                 client_cert.as_deref(),
                 client_key.as_deref(),
@@ -475,5 +552,58 @@ mod tests {
         assert!(is_loopback_host("[::1]"));
         assert!(!is_loopback_host("10.0.0.1"));
         assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn parses_status_and_replay_admin_token_and_insecure_flags() {
+        let cli_status = Cli::try_parse_from([
+            "edgegate",
+            "status",
+            "--url",
+            "http://10.0.0.1:8080",
+            "--admin-token",
+            "test-token",
+            "--allow-insecure-http",
+        ]);
+        assert!(cli_status.is_ok());
+        if let Ok(Cli {
+            command:
+                Command::Status {
+                    admin_token,
+                    allow_insecure_http,
+                    ..
+                },
+        }) = cli_status
+        {
+            assert_eq!(admin_token.as_deref(), Some("test-token"));
+            assert!(allow_insecure_http);
+        } else {
+            panic!("expected Command::Status");
+        }
+
+        let cli_replay = Cli::try_parse_from([
+            "edgegate",
+            "replay",
+            "--url",
+            "http://10.0.0.1:8080",
+            "--admin-token",
+            "test-token-2",
+            "--allow-insecure-http",
+        ]);
+        assert!(cli_replay.is_ok());
+        if let Ok(Cli {
+            command:
+                Command::Replay {
+                    admin_token,
+                    allow_insecure_http,
+                    ..
+                },
+        }) = cli_replay
+        {
+            assert_eq!(admin_token.as_deref(), Some("test-token-2"));
+            assert!(allow_insecure_http);
+        } else {
+            panic!("expected Command::Replay");
+        }
     }
 }
