@@ -261,6 +261,7 @@ value = "ghp_boxlet_secret"
                 workload_id: "boxlet-vm-42".to_string(),
                 org_id: "org-boxlet".to_string(),
                 roles: ["sandbox:exec".to_string()].into_iter().collect(),
+                max_concurrent_requests: None,
             },
         )
         .unwrap_or_else(|e| panic!("register_boxlet_sandbox: {e}"));

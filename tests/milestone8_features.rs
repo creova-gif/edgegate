@@ -14,7 +14,9 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1 as client_http1;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
@@ -83,12 +85,13 @@ async fn spawn_mtls_upstream(
     .build()
     .unwrap_or_else(|e| panic!("client verifier: {e}"));
 
-    let tls_cfg = RustlsServerConfig::builder_with_provider(provider)
+    let mut tls_cfg = RustlsServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap_or_else(|e| panic!("proto: {e}"))
         .with_client_cert_verifier(verifier)
         .with_single_cert(srv_certs, srv_key)
         .unwrap_or_else(|e| panic!("single_cert: {e}"));
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -113,7 +116,9 @@ async fn spawn_mtls_upstream(
                     let body = format!("mtls-verified:{}", req.uri().path());
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
                 });
-                let _ = server_http1::Builder::new().serve_connection(io, svc).await;
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
             });
         }
     });
@@ -167,11 +172,12 @@ token = "tok-mtls"
 [[pools]]
 name = "mtls-authenticated-pool"
 allow_private_ip = true
+health_check_path = "/healthz"
 ca_cert_pem = '''{ca_pem}'''
 client_cert_pem = '''{cli_cert_pem}'''
 client_key_pem = '''{cli_key_pem}'''
 backends = [
-  {{ id = "mtls-b1", address = "{mtls_addr}", tls = true, tls_sni = "localhost" }}
+  {{ id = "mtls-b1", address = "{mtls_addr}", tls = true, tls_sni = "localhost", http2 = true }}
 ]
 
 [[pools]]
@@ -217,6 +223,7 @@ path_prefix = "/v1/mtls-nocert"
         .local_addr()
         .unwrap_or_else(|e| panic!("gw addr: {e}"));
     let proxy = Arc::new(EdgeGateProxy::new(compiled));
+    let _health_handle = proxy.spawn_active_health_probes();
     let runner = Arc::clone(&proxy);
     let (_tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -234,6 +241,19 @@ path_prefix = "/v1/mtls-nocert"
     let (status, _, body) = send_http1(gw_addr, ok_req).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "mtls-verified:/secure-data");
+
+    // Verify active health check probe succeeds over HTTP/2 mTLS and backend stays healthy
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let ok_req2 = Request::builder()
+        .method("GET")
+        .uri("/v1/mtls-ok/secure-data")
+        .header("host", "edgegate.local")
+        .header("x-edgegate-token", "tok-mtls")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|e| panic!("req: {e}"));
+    let (status2, _, body2) = send_http1(gw_addr, ok_req2).await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(body2, "mtls-verified:/secure-data");
 
     // 2. Pool without client certificate fails TLS handshake against mTLS upstream (`502 Bad Gateway`).
     let fail_req = Request::builder()
@@ -488,14 +508,20 @@ path_prefix = "/v1/app"
 
 #[tokio::test]
 async fn admin_pools_endpoint_reports_live_backend_health_and_circuit_breaker_state() {
-    // Bind and immediately drop a listener to obtain a guaranteed closed port that trips the circuit breaker.
+    // Spawn a background task on dead_listener that accepts connections and immediately
+    // drops the stream so dead_addr deterministically produces a 502 Bad Gateway transport
+    // failure without releasing the port!
     let dead_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| panic!("bind dead: {e}"));
     let dead_addr = dead_listener
         .local_addr()
         .unwrap_or_else(|e| panic!("dead addr: {e}"));
-    drop(dead_listener);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = dead_listener.accept().await {
+            drop(stream);
+        }
+    });
 
     let live_listener = TcpListener::bind("127.0.0.1:0")
         .await

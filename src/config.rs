@@ -77,6 +77,8 @@ pub struct UnixListenerConfig {
     pub org_id: String,
     #[serde(default)]
     pub roles: Vec<String>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +95,8 @@ pub struct WorkloadConfig {
     pub secondary_token_sha256: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -173,6 +177,12 @@ pub struct RouteConfig {
     /// Optional shadow upstream pool for asynchronous live traffic mirroring & status diffing (`Milestone 3`).
     #[serde(default)]
     pub shadow_pool: Option<String>,
+    /// Optional per-route response timeout override in milliseconds (`Milestone 9`).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Optional maximum upstream response body size in bytes (`Milestone 9`).
+    #[serde(default)]
+    pub max_response_body_bytes: Option<usize>,
     /// Optional response header names to strip before returning responses to workloads (`Milestone 8`).
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
@@ -219,6 +229,9 @@ pub struct PolicyRuleConfig {
     /// Optional egress DLP payload substrings blocked on outbound request bodies (`Milestone 8`).
     #[serde(default)]
     pub blocked_body_substrings: Vec<String>,
+    /// Optional JSON-RPC 2.0 / MCP allowed tool-call methods (`Milestone 9`).
+    #[serde(default)]
+    pub allowed_jsonrpc_methods: Vec<String>,
     /// Optional per-rule request body size limit in bytes (`Milestone 7`; must be `> 0` if `Some`).
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
@@ -328,6 +341,7 @@ pub struct CompiledWorkload {
     pub workload_id: String,
     pub org_id: String,
     pub roles: HashSet<String>,
+    pub max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +382,8 @@ pub struct CompiledRoute {
     pub strip_prefix: bool,
     pub pool: String,
     pub shadow_pool: Option<String>,
+    pub response_timeout: Option<Duration>,
+    pub max_response_body_bytes: Option<usize>,
     pub strip_response_headers: Vec<HeaderName>,
     pub inject_response_headers: Vec<(HeaderName, HeaderValue)>,
     pub credential: Option<CompiledCredentialBinding>,
@@ -392,6 +408,7 @@ pub struct CompiledPolicyRule {
     pub required_headers: HashMap<String, String>,
     pub forbidden_query_params: Vec<String>,
     pub blocked_body_substrings: Vec<String>,
+    pub allowed_jsonrpc_methods: Vec<String>,
     pub max_body_bytes: Option<usize>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
@@ -466,6 +483,11 @@ impl CompiledConfig {
                     "unix_listener workload_id and org_id must be non-empty".to_string(),
                 ));
             }
+            if u.max_concurrent_requests == Some(0) {
+                return Err(EdgeGateError::Config(
+                    "max_concurrent_requests must be > 0".to_string(),
+                ));
+            }
             if u.path.as_os_str().is_empty() || !seen_uds_paths.insert(u.path.clone()) {
                 return Err(EdgeGateError::Config(format!(
                     "empty or duplicate unix_listener path '{}'",
@@ -478,6 +500,7 @@ impl CompiledConfig {
                     workload_id: u.workload_id,
                     org_id: u.org_id,
                     roles: u.roles.into_iter().collect(),
+                    max_concurrent_requests: u.max_concurrent_requests,
                 },
             });
         }
@@ -487,6 +510,11 @@ impl CompiledConfig {
             if w.workload_id.trim().is_empty() || w.org_id.trim().is_empty() {
                 return Err(EdgeGateError::Config(
                     "workload_id and org_id must be non-empty".to_string(),
+                ));
+            }
+            if w.max_concurrent_requests == Some(0) {
+                return Err(EdgeGateError::Config(
+                    "max_concurrent_requests must be > 0".to_string(),
                 ));
             }
             let digest = match (w.token, w.token_sha256) {
@@ -522,6 +550,7 @@ impl CompiledConfig {
                 workload_id: w.workload_id.clone(),
                 org_id: w.org_id,
                 roles: w.roles.into_iter().collect(),
+                max_concurrent_requests: w.max_concurrent_requests,
             };
             if workloads
                 .insert(digest, compiled_workload.clone())
@@ -749,6 +778,20 @@ impl CompiledConfig {
                     )));
                 }
             }
+            if r.timeout_ms == Some(0) {
+                return Err(EdgeGateError::Config(format!(
+                    "route '{}' timeout_ms must be > 0",
+                    r.id
+                )));
+            }
+            if r.max_response_body_bytes == Some(0) {
+                return Err(EdgeGateError::Config(format!(
+                    "route '{}' max_response_body_bytes must be > 0",
+                    r.id
+                )));
+            }
+            let response_timeout = r.timeout_ms.map(Duration::from_millis);
+            let max_response_body_bytes = r.max_response_body_bytes;
             let mut strip_response_headers = Vec::with_capacity(r.strip_response_headers.len());
             for raw_hdr in r.strip_response_headers {
                 let trimmed = raw_hdr.trim();
@@ -767,6 +810,7 @@ impl CompiledConfig {
                 strip_response_headers.push(hdr_name);
             }
             let mut inject_response_headers = Vec::with_capacity(r.inject_response_headers.len());
+            let mut seen_inject = HashSet::new();
             for (raw_name, raw_val) in r.inject_response_headers {
                 let trimmed = raw_name.trim();
                 if trimmed.is_empty() {
@@ -781,6 +825,12 @@ impl CompiledConfig {
                         r.id
                     ))
                 })?;
+                if !seen_inject.insert(hdr_name.clone()) {
+                    return Err(EdgeGateError::Config(format!(
+                        "route '{}' has duplicate inject_response_headers key '{}'",
+                        r.id, hdr_name
+                    )));
+                }
                 let hdr_val = HeaderValue::from_str(&raw_val).map_err(|e| {
                     EdgeGateError::Config(format!(
                         "route '{}' invalid inject_response_headers value for '{raw_name}': {e}",
@@ -822,6 +872,8 @@ impl CompiledConfig {
                 strip_prefix: r.strip_prefix,
                 pool: r.pool,
                 shadow_pool: r.shadow_pool,
+                response_timeout,
+                max_response_body_bytes,
                 strip_response_headers,
                 inject_response_headers,
                 credential,
@@ -893,6 +945,17 @@ impl CompiledConfig {
                 }
                 blocked_body_substrings.push(pat);
             }
+            let mut allowed_jsonrpc_methods = Vec::with_capacity(pol.allowed_jsonrpc_methods.len());
+            for m in pol.allowed_jsonrpc_methods {
+                let trimmed = m.trim();
+                if trimmed.is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "policy for route '{}' has empty allowed_jsonrpc_methods entry",
+                        pol.route_id
+                    )));
+                }
+                allowed_jsonrpc_methods.push(trimmed.to_string());
+            }
             let mut methods = HashSet::with_capacity(pol.methods.len());
             for m in pol.methods {
                 let parsed =
@@ -928,6 +991,7 @@ impl CompiledConfig {
                 required_headers,
                 forbidden_query_params,
                 blocked_body_substrings,
+                allowed_jsonrpc_methods,
                 max_body_bytes: pol.max_body_bytes,
                 rate_limit_rps: pol.rate_limit_rps,
                 rate_limit_burst: pol.rate_limit_burst,

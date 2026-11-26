@@ -9,7 +9,7 @@ const GENESIS_AUDIT_HASH: &str = "0000000000000000000000000000000000000000000000
 
 /// Cryptographic SHA-256 hash-chained audit ledger entry (`Milestone 7`).
 /// Strictly excludes request/response headers, bodies, and secret material.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuditChainEntry {
     pub seq: u64,
     pub request_id: u64,
@@ -65,6 +65,8 @@ pub struct Telemetry {
     secret_reflections_blocked_total: AtomicU64,
     secret_rotations_total: AtomicU64,
     dlp_blocked_total: AtomicU64,
+    bulkhead_rejected_total: AtomicU64,
+    jsonrpc_blocked_total: AtomicU64,
     retries_total: AtomicU64,
     in_flight_requests: AtomicU64,
     latency_le_100us: AtomicU64,
@@ -94,6 +96,8 @@ pub struct TelemetrySnapshot {
     pub secret_reflections_blocked_total: u64,
     pub secret_rotations_total: u64,
     pub dlp_blocked_total: u64,
+    pub bulkhead_rejected_total: u64,
+    pub jsonrpc_blocked_total: u64,
     pub retries_total: u64,
     pub in_flight_requests: u64,
 }
@@ -125,6 +129,8 @@ impl Telemetry {
             secret_reflections_blocked_total: AtomicU64::new(0),
             secret_rotations_total: AtomicU64::new(0),
             dlp_blocked_total: AtomicU64::new(0),
+            bulkhead_rejected_total: AtomicU64::new(0),
+            jsonrpc_blocked_total: AtomicU64::new(0),
             retries_total: AtomicU64::new(0),
             in_flight_requests: AtomicU64::new(0),
             latency_le_100us: AtomicU64::new(0),
@@ -176,6 +182,14 @@ impl Telemetry {
 
     pub fn record_dlp_blocked(&self) {
         self.dlp_blocked_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_bulkhead_rejected(&self) {
+        self.bulkhead_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_jsonrpc_blocked(&self) {
+        self.jsonrpc_blocked_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reload_success(&self) -> u64 {
@@ -256,6 +270,8 @@ impl Telemetry {
                 .load(Ordering::Relaxed),
             secret_rotations_total: self.secret_rotations_total.load(Ordering::Relaxed),
             dlp_blocked_total: self.dlp_blocked_total.load(Ordering::Relaxed),
+            bulkhead_rejected_total: self.bulkhead_rejected_total.load(Ordering::Relaxed),
+            jsonrpc_blocked_total: self.jsonrpc_blocked_total.load(Ordering::Relaxed),
             retries_total: self.retries_total.load(Ordering::Relaxed),
             in_flight_requests: self.in_flight_requests.load(Ordering::Acquire),
         }
@@ -265,7 +281,7 @@ impl Telemetry {
         let s = self.snapshot();
         let audit_valid = self.verify_audit_chain();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"dlp_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"dlp_blocked_total\":{},\"bulkhead_rejected_total\":{},\"jsonrpc_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -278,6 +294,8 @@ impl Telemetry {
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
             s.dlp_blocked_total,
+            s.bulkhead_rejected_total,
+            s.jsonrpc_blocked_total,
             s.retries_total,
             s.in_flight_requests,
             audit_valid
@@ -332,6 +350,12 @@ impl Telemetry {
              # HELP edgegate_dlp_blocked_total Total outbound requests blocked by EdgeGate DLP payload inspection.\n\
              # TYPE edgegate_dlp_blocked_total counter\n\
              edgegate_dlp_blocked_total {}\n\
+             # HELP edgegate_bulkhead_rejected_total Total requests rejected by per-workload concurrency bulkhead quotas.\n\
+             # TYPE edgegate_bulkhead_rejected_total counter\n\
+             edgegate_bulkhead_rejected_total {}\n\
+             # HELP edgegate_jsonrpc_blocked_total Total requests blocked by JSON-RPC method allowlist policy.\n\
+             # TYPE edgegate_jsonrpc_blocked_total counter\n\
+             edgegate_jsonrpc_blocked_total {}\n\
              # HELP edgegate_retries_total Total controlled idempotent upstream failover retries.\n\
              # TYPE edgegate_retries_total counter\n\
              edgegate_retries_total {}\n\
@@ -361,6 +385,8 @@ impl Telemetry {
             s.secret_reflections_blocked_total,
             s.secret_rotations_total,
             s.dlp_blocked_total,
+            s.bulkhead_rejected_total,
+            s.jsonrpc_blocked_total,
             s.retries_total,
             s.in_flight_requests,
             b100,
@@ -602,7 +628,77 @@ fn compute_audit_entry_hash(
 }
 
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c < '\x20' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Verifies a raw JSON audit response string from `/_edgegate/admin/audit` cryptographically.
+/// Returns the number of verified entries on success, or an error description.
+pub fn verify_audit_json(raw_json: &str) -> Result<usize, String> {
+    #[derive(serde::Deserialize)]
+    struct AuditResponse {
+        valid: bool,
+        entries: Vec<AuditChainEntry>,
+    }
+
+    let parsed: AuditResponse =
+        serde_json::from_str(raw_json).map_err(|e| format!("failed to parse audit JSON: {e}"))?;
+
+    if !parsed.valid {
+        return Err("server reported valid=false".to_string());
+    }
+
+    let mut prev_entry: Option<&AuditChainEntry> = None;
+    for entry in &parsed.entries {
+        if entry.seq == 1 && entry.prev_hash != GENESIS_AUDIT_HASH {
+            return Err(format!(
+                "entry seq 1 has invalid prev_hash '{}' (expected genesis hash)",
+                entry.prev_hash
+            ));
+        }
+        if let Some(prev) = prev_entry {
+            if entry.prev_hash != prev.entry_hash {
+                return Err(format!(
+                    "entry seq {} prev_hash '{}' does not match previous entry_hash '{}'",
+                    entry.seq, entry.prev_hash, prev.entry_hash
+                ));
+            }
+            if entry.seq != prev.seq + 1 {
+                return Err(format!(
+                    "entry seq {} is not sequential after previous seq {}",
+                    entry.seq, prev.seq
+                ));
+            }
+        }
+        let recomputed = compute_audit_entry_hash(
+            &entry.prev_hash,
+            entry.seq,
+            entry.request_id,
+            &entry.trace_id,
+            &entry.org_id,
+            &entry.workload_id,
+            &entry.route,
+            &entry.decision,
+            entry.status,
+        );
+        if entry.entry_hash != recomputed {
+            return Err(format!(
+                "entry seq {} entry_hash '{}' does not match recomputed hash '{}'",
+                entry.seq, entry.entry_hash, recomputed
+            ));
+        }
+        prev_entry = Some(entry);
+    }
+
+    Ok(parsed.entries.len())
 }
 
 pub fn init_json_logging() {

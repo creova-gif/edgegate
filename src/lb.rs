@@ -426,7 +426,16 @@ impl LoadBalancer for PoolLoadBalancer {
 }
 
 fn escape_lb_json(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c < '\x20' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn release_half_open_probe(circuit: &Mutex<CircuitState>) {

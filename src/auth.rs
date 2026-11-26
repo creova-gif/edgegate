@@ -15,6 +15,7 @@ pub struct WorkloadIdentity {
     pub workload_id: String,
     pub org_id: String,
     pub roles: HashSet<String>,
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Trait seam for workload authentication (header token or transport-bound UDS socket).
@@ -58,6 +59,7 @@ impl WorkloadAuthenticator for HeaderTokenAuthenticator {
                     workload_id: workload.workload_id.clone(),
                     org_id: workload.org_id.clone(),
                     roles: workload.roles.clone(),
+                    max_concurrent_requests: workload.max_concurrent_requests,
                 });
             }
         }
@@ -81,6 +83,7 @@ impl TransportBoundAuthenticator {
                 workload_id: workload.workload_id,
                 org_id: workload.org_id,
                 roles: workload.roles,
+                max_concurrent_requests: workload.max_concurrent_requests,
             },
         }
     }
@@ -106,6 +109,7 @@ mod tests {
                 workload_id: "agent-1".to_string(),
                 org_id: "org-alpha".to_string(),
                 roles: ["repo:read".to_string()].into_iter().collect(),
+                max_concurrent_requests: None,
             },
         );
         HeaderTokenAuthenticator::new(map)
@@ -134,6 +138,7 @@ mod tests {
             workload_id: "boxlet-sandbox-1".to_string(),
             org_id: "org-alpha".to_string(),
             roles: ["inference:call".to_string()].into_iter().collect(),
+            max_concurrent_requests: None,
         });
         let id = auth
             .authenticate(&HeaderMap::new())

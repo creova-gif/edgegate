@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -35,6 +36,8 @@ use crate::telemetry::{ReplayRecord, Telemetry};
 use crate::EdgeGateError;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
+type WorkloadBulkheadMap = HashMap<(String, String), (usize, Arc<tokio::sync::Semaphore>)>;
 
 /// Optional routing-key header for `ConsistentHash` load balancing (`Milestone 3`).
 pub const ROUTING_KEY_HEADER: &str = "x-edgegate-routing-key";
@@ -123,6 +126,7 @@ impl RuntimeSnapshot {
 pub struct EdgeGateProxy {
     runtime: Arc<ArcSwap<RuntimeSnapshot>>,
     telemetry: Arc<Telemetry>,
+    bulkheads: Mutex<WorkloadBulkheadMap>,
 }
 
 impl EdgeGateProxy {
@@ -132,6 +136,7 @@ impl EdgeGateProxy {
         Self {
             runtime: Arc::new(ArcSwap::new(snapshot)),
             telemetry: Arc::new(Telemetry::with_replay_capacity(replay_cap)),
+            bulkheads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -544,18 +549,17 @@ impl EdgeGateProxy {
         }
 
         let req_id = self.telemetry.next_request_id();
-        let (traceparent, trace_id) = resolve_or_generate_traceparent(req.headers(), req_id);
+        let req_headers = req.headers().clone();
+        let (traceparent, trace_id) = resolve_or_generate_traceparent(&req_headers, req_id);
 
         let method = req.method().clone();
         let path = path.to_string();
         let query = req.uri().query().map(ToString::to_string);
-        let host_header = req
-            .headers()
+        let host_header = req_headers
             .get(HOST)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
-        let routing_key = req
-            .headers()
+        let routing_key = req_headers
             .get(ROUTING_KEY_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
@@ -569,7 +573,7 @@ impl EdgeGateProxy {
 
         // Step 2: Authenticate workload (transport-bound UDS identity OR X-EdgeGate-Token header).
         let identity: WorkloadIdentity = match transport_auth {
-            Some(ta) => match ta.authenticate(req.headers()) {
+            Some(ta) => match ta.authenticate(&req_headers) {
                 Ok(id) => id,
                 Err(err) => {
                     return self.finish_error(
@@ -577,7 +581,7 @@ impl EdgeGateProxy {
                     );
                 }
             },
-            None => match snap.auth.authenticate(req.headers()) {
+            None => match snap.auth.authenticate(&req_headers) {
                 Ok(id) => id,
                 Err(err) => {
                     return self.finish_error(
@@ -585,6 +589,63 @@ impl EdgeGateProxy {
                     );
                 }
             },
+        };
+
+        // Step 2b: Per-workload concurrency quota / bulkhead isolation (INV-20).
+        let _workload_bulkhead_permit = if let Some(limit) = identity.max_concurrent_requests {
+            let sem = {
+                let mut guard = match self.bulkheads.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let key = (identity.org_id.clone(), identity.workload_id.clone());
+                match guard.get(&key) {
+                    Some((existing_limit, sem)) if *existing_limit == limit => Arc::clone(sem),
+                    _ => {
+                        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+                        guard.insert(key, (limit, Arc::clone(&sem)));
+                        sem
+                    }
+                }
+            };
+            match sem.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.telemetry.record_bulkhead_rejected();
+                    self.telemetry.record_replay(ReplayRecord {
+                        request_id: req_id,
+                        trace_id: trace_id.clone(),
+                        org_id: identity.org_id.clone(),
+                        workload_id: identity.workload_id.clone(),
+                        method: method.as_str().to_string(),
+                        path: path.clone(),
+                        route: "-".to_string(),
+                        upstream: "-".to_string(),
+                        status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        shadow_status: None,
+                        reason: "workload_bulkhead_rejected".to_string(),
+                        latency_us: started.elapsed().as_micros() as u64,
+                    });
+                    let mut resp = self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        "-",
+                        "-",
+                        "RATE_LIMITED",
+                        EdgeGateError::TooManyRequests(
+                            "workload concurrency quota exceeded".to_string(),
+                        ),
+                        started,
+                    );
+                    resp.headers_mut()
+                        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                    return resp;
+                }
+            }
+        } else {
+            None
         };
 
         // Step 3: Match explicit route (default-deny unmatched destination).
@@ -606,19 +667,74 @@ impl EdgeGateProxy {
         };
 
         // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/query/headers policy + rate limit.
-        let (rule_max_body_bytes, blocked_body_substrings) = match snap.policy.evaluate_request(
-            &identity,
-            &route.id,
-            &method,
-            &path,
-            query.as_deref(),
-            req.headers(),
-        ) {
-            PolicyDecision::Allow {
-                max_body_bytes,
-                blocked_body_substrings,
-            } => (max_body_bytes, blocked_body_substrings),
-            PolicyDecision::Deny { reason } => {
+        let (rule_max_body_bytes, blocked_body_substrings, allowed_jsonrpc_methods) =
+            match snap.policy.evaluate_request(
+                &identity,
+                &route.id,
+                &method,
+                &path,
+                query.as_deref(),
+                &req_headers,
+            ) {
+                PolicyDecision::Allow {
+                    max_body_bytes,
+                    blocked_body_substrings,
+                    allowed_jsonrpc_methods,
+                } => (
+                    max_body_bytes,
+                    blocked_body_substrings,
+                    allowed_jsonrpc_methods,
+                ),
+                PolicyDecision::Deny { reason } => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        "-",
+                        "BLOCKED",
+                        EdgeGateError::Forbidden(reason),
+                        started,
+                    );
+                }
+                PolicyDecision::RateLimited { reason } => {
+                    self.telemetry.record_replay(ReplayRecord {
+                        request_id: req_id,
+                        trace_id: trace_id.clone(),
+                        org_id: identity.org_id.clone(),
+                        workload_id: identity.workload_id.clone(),
+                        method: method.as_str().to_string(),
+                        path: path.clone(),
+                        route: route.id.clone(),
+                        upstream: "-".to_string(),
+                        status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        shadow_status: None,
+                        reason: "rate_limited".to_string(),
+                        latency_us: started.elapsed().as_micros() as u64,
+                    });
+                    let mut resp = self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        "-",
+                        "RATE_LIMITED",
+                        EdgeGateError::TooManyRequests(reason),
+                        started,
+                    );
+                    resp.headers_mut()
+                        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                    return resp;
+                }
+            };
+
+        // Step 4a: Bounded request body collection BEFORE upstream selection.
+        let max_body = rule_max_body_bytes.unwrap_or(snap.config.max_request_body_bytes);
+        let collected = match Limited::new(req.into_body(), max_body).collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => {
                 return self.finish_error(
                     req_id,
                     &trace_id,
@@ -627,11 +743,74 @@ impl EdgeGateProxy {
                     &route.id,
                     "-",
                     "BLOCKED",
-                    EdgeGateError::Forbidden(reason),
+                    EdgeGateError::PayloadTooLarge(format!(
+                        "request body exceeds limit of {max_body} bytes"
+                    )),
                     started,
                 );
             }
-            PolicyDecision::RateLimited { reason } => {
+        };
+
+        // Step 4b: Egress DLP Request Payload Guard (`Milestone 8`) BEFORE upstream selection.
+        if let Some(matched_pat) = blocked_body_substrings.iter().find(|pat| {
+            let needle = pat.as_bytes();
+            !needle.is_empty() && collected.windows(needle.len()).any(|w| w == needle)
+        }) {
+            let latency_us = started.elapsed().as_micros() as u64;
+            self.telemetry.record_dlp_blocked();
+            self.telemetry.record_replay(ReplayRecord {
+                request_id: req_id,
+                trace_id: trace_id.clone(),
+                org_id: identity.org_id.clone(),
+                workload_id: identity.workload_id.clone(),
+                method: method.as_str().to_string(),
+                path: path.clone(),
+                route: route.id.clone(),
+                upstream: "-".to_string(),
+                status: StatusCode::FORBIDDEN.as_u16(),
+                shadow_status: None,
+                reason: "dlp_payload_blocked".to_string(),
+                latency_us,
+            });
+            return self.finish_error(
+                req_id,
+                &trace_id,
+                &identity.org_id,
+                &identity.workload_id,
+                &route.id,
+                "-",
+                "BLOCKED",
+                EdgeGateError::Forbidden(format!(
+                    "egress DLP blocked forbidden payload pattern '{matched_pat}'"
+                )),
+                started,
+            );
+        }
+
+        // Step 4c: JSON-RPC 2.0 / MCP Tool-Call Method Allowlist Guard (`Milestone 9`) BEFORE upstream selection.
+        if !allowed_jsonrpc_methods.is_empty() {
+            let is_allowed = match serde_json::from_slice::<serde_json::Value>(&collected) {
+                Ok(serde_json::Value::Object(map)) => map
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| allowed_jsonrpc_methods.iter().any(|allowed| allowed == m)),
+                Ok(serde_json::Value::Array(items)) if !items.is_empty() => {
+                    items.iter().all(|item| {
+                        if let serde_json::Value::Object(map) = item {
+                            map.get("method").and_then(|v| v.as_str()).is_some_and(|m| {
+                                allowed_jsonrpc_methods.iter().any(|allowed| allowed == m)
+                            })
+                        } else {
+                            false
+                        }
+                    })
+                }
+                _ => false,
+            };
+
+            if !is_allowed {
+                let latency_us = started.elapsed().as_micros() as u64;
+                self.telemetry.record_jsonrpc_blocked();
                 self.telemetry.record_replay(ReplayRecord {
                     request_id: req_id,
                     trace_id: trace_id.clone(),
@@ -641,27 +820,26 @@ impl EdgeGateProxy {
                     path: path.clone(),
                     route: route.id.clone(),
                     upstream: "-".to_string(),
-                    status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    status: StatusCode::FORBIDDEN.as_u16(),
                     shadow_status: None,
-                    reason: "rate_limited".to_string(),
-                    latency_us: started.elapsed().as_micros() as u64,
+                    reason: "jsonrpc_method_blocked".to_string(),
+                    latency_us,
                 });
-                let mut resp = self.finish_error(
+                return self.finish_error(
                     req_id,
                     &trace_id,
                     &identity.org_id,
                     &identity.workload_id,
                     &route.id,
                     "-",
-                    "RATE_LIMITED",
-                    EdgeGateError::TooManyRequests(reason),
+                    "BLOCKED",
+                    EdgeGateError::Forbidden(
+                        "JSON-RPC/MCP method not allowed by policy".to_string(),
+                    ),
                     started,
                 );
-                resp.headers_mut()
-                    .insert(RETRY_AFTER, HeaderValue::from_static("1"));
-                return resp;
             }
-        };
+        }
 
         // Step 5: Select healthy backend via LoadBalancer (supports ConsistentHash routing key).
         let effective_key = routing_key.as_deref().unwrap_or(&identity.workload_id);
@@ -701,26 +879,23 @@ impl EdgeGateProxy {
 
         // Step 6: Sanitize outbound headers, propagate W3C traceparent, and inject scoped upstream credential.
         let target_cred_header = route.credential.as_ref().map(|c| &c.header_name);
-        let mut outbound_headers = match sanitize_outbound_headers(
-            req.headers(),
-            &backend_authority,
-            target_cred_header,
-        ) {
-            Ok(h) => h,
-            Err(err) => {
-                return self.finish_error(
-                    req_id,
-                    &trace_id,
-                    &identity.org_id,
-                    &identity.workload_id,
-                    &route.id,
-                    &backend_id,
-                    "ERROR",
-                    err,
-                    started,
-                );
-            }
-        };
+        let mut outbound_headers =
+            match sanitize_outbound_headers(&req_headers, &backend_authority, target_cred_header) {
+                Ok(h) => h,
+                Err(err) => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        &backend_id,
+                        "ERROR",
+                        err,
+                        started,
+                    );
+                }
+            };
         if let Ok(tp_val) = HeaderValue::from_str(&traceparent) {
             outbound_headers.insert(HeaderName::from_static(TRACEPARENT_HEADER), tp_val);
         }
@@ -767,62 +942,6 @@ impl EdgeGateProxy {
             if binding.block_secret_reflection && !secret.expose().is_empty() {
                 reflection_guard_secret = Some(secret);
             }
-        }
-
-        let max_body = rule_max_body_bytes.unwrap_or(snap.config.max_request_body_bytes);
-        let collected = match Limited::new(req.into_body(), max_body).collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(_) => {
-                return self.finish_error(
-                    req_id,
-                    &trace_id,
-                    &identity.org_id,
-                    &identity.workload_id,
-                    &route.id,
-                    &backend_id,
-                    "BLOCKED",
-                    EdgeGateError::PayloadTooLarge(format!(
-                        "request body exceeds limit of {max_body} bytes"
-                    )),
-                    started,
-                );
-            }
-        };
-
-        // Step 6b: Egress DLP Request Payload Guard (`Milestone 8`).
-        if let Some(matched_pat) = blocked_body_substrings.iter().find(|pat| {
-            let needle = pat.as_bytes();
-            !needle.is_empty() && collected.windows(needle.len()).any(|w| w == needle)
-        }) {
-            let latency_us = started.elapsed().as_micros() as u64;
-            self.telemetry.record_dlp_blocked();
-            self.telemetry.record_replay(ReplayRecord {
-                request_id: req_id,
-                trace_id: trace_id.clone(),
-                org_id: identity.org_id.clone(),
-                workload_id: identity.workload_id.clone(),
-                method: method.as_str().to_string(),
-                path: path.clone(),
-                route: route.id.clone(),
-                upstream: backend_id.clone(),
-                status: StatusCode::FORBIDDEN.as_u16(),
-                shadow_status: None,
-                reason: "dlp_payload_blocked".to_string(),
-                latency_us,
-            });
-            return self.finish_error(
-                req_id,
-                &trace_id,
-                &identity.org_id,
-                &identity.workload_id,
-                &route.id,
-                &backend_id,
-                "BLOCKED",
-                EdgeGateError::Forbidden(format!(
-                    "egress DLP blocked forbidden payload pattern '{matched_pat}'"
-                )),
-                started,
-            );
         }
 
         let upstream_pq = rewrite_upstream_path_and_query(&path, query.as_deref(), &route);
@@ -879,7 +998,11 @@ impl EdgeGateProxy {
             *outbound_req.headers_mut() = outbound_headers.clone();
 
             lease.settle_probe();
-            match snap.pool.send(lease, outbound_req).await {
+            match snap
+                .pool
+                .send_with_timeout(lease, outbound_req, route.response_timeout)
+                .await
+            {
                 Ok(resp) => break Ok(resp),
                 Err(EdgeGateError::BadGateway(msg)) if attempt < max_retries => {
                     snap.lb.record_failure(&pool_name, &backend_id);
@@ -901,8 +1024,8 @@ impl EdgeGateProxy {
 
         match send_res {
             Ok(resp) => {
-                // Step 7a: Response Credential Reflection Guard (`Milestone 5`).
-                let mapped = if let Some(ref secret) = reflection_guard_secret {
+                // Step 7a: Response Credential Reflection Guard (`Milestone 5`) & Max Response Body Bytes (`Milestone 9`).
+                if let Some(ref secret) = reflection_guard_secret {
                     let needle = secret.expose().as_bytes();
                     let header_reflected = resp.headers().values().any(|v| {
                         v.as_bytes()
@@ -940,13 +1063,93 @@ impl EdgeGateProxy {
                             started,
                         );
                     }
+                }
 
+                let mapped = if route.max_response_body_bytes.is_some()
+                    || reflection_guard_secret.is_some()
+                {
                     let (parts, incoming_body) = resp.into_parts();
-                    let body_bytes = match incoming_body.collect().await {
-                        Ok(c) => c.to_bytes(),
-                        Err(err) => {
+                    let body_bytes = if let Some(limit) = route.max_response_body_bytes {
+                        match Limited::new(incoming_body, limit).collect().await {
+                            Ok(c) => c.to_bytes(),
+                            Err(_) => {
+                                let latency_us = started.elapsed().as_micros() as u64;
+                                snap.lb.record_failure(&pool_name, &backend_id);
+                                self.telemetry.record_replay(ReplayRecord {
+                                    request_id: req_id,
+                                    trace_id: trace_id.clone(),
+                                    org_id: identity.org_id.clone(),
+                                    workload_id: identity.workload_id.clone(),
+                                    method: method.as_str().to_string(),
+                                    path: path.clone(),
+                                    route: route.id.clone(),
+                                    upstream: backend_id.clone(),
+                                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                                    shadow_status: None,
+                                    reason: "max_response_body_bytes_exceeded".to_string(),
+                                    latency_us,
+                                });
+                                return self.finish_error(
+                                    req_id,
+                                    &trace_id,
+                                    &identity.org_id,
+                                    &identity.workload_id,
+                                    &route.id,
+                                    &backend_id,
+                                    "ERROR",
+                                    EdgeGateError::BadGateway(
+                                        "upstream response body exceeds max_response_body_bytes"
+                                            .to_string(),
+                                    ),
+                                    started,
+                                );
+                            }
+                        }
+                    } else {
+                        match incoming_body.collect().await {
+                            Ok(c) => c.to_bytes(),
+                            Err(err) => {
+                                let latency_us = started.elapsed().as_micros() as u64;
+                                snap.lb.record_failure(&pool_name, &backend_id);
+                                self.telemetry.record_replay(ReplayRecord {
+                                    request_id: req_id,
+                                    trace_id: trace_id.clone(),
+                                    org_id: identity.org_id.clone(),
+                                    workload_id: identity.workload_id.clone(),
+                                    method: method.as_str().to_string(),
+                                    path: path.clone(),
+                                    route: route.id.clone(),
+                                    upstream: backend_id.clone(),
+                                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                                    shadow_status: None,
+                                    reason: "upstream_transport_or_timeout".to_string(),
+                                    latency_us,
+                                });
+                                return self.finish_error(
+                                    req_id,
+                                    &trace_id,
+                                    &identity.org_id,
+                                    &identity.workload_id,
+                                    &route.id,
+                                    &backend_id,
+                                    "ERROR",
+                                    EdgeGateError::BadGateway(format!(
+                                        "failed to read upstream response body: {err}"
+                                    )),
+                                    started,
+                                );
+                            }
+                        }
+                    };
+
+                    if let Some(ref secret) = reflection_guard_secret {
+                        let needle = secret.expose().as_bytes();
+                        let body_reflected = body_bytes
+                            .windows(needle.len())
+                            .any(|window| window == needle);
+                        if body_reflected {
                             let latency_us = started.elapsed().as_micros() as u64;
-                            snap.lb.record_failure(&pool_name, &backend_id);
+                            self.telemetry.record_secret_reflection_blocked();
                             self.telemetry.record_replay(ReplayRecord {
                                 request_id: req_id,
                                 trace_id: trace_id.clone(),
@@ -958,7 +1161,7 @@ impl EdgeGateProxy {
                                 upstream: backend_id.clone(),
                                 status: StatusCode::BAD_GATEWAY.as_u16(),
                                 shadow_status: None,
-                                reason: "upstream_transport_or_timeout".to_string(),
+                                reason: "credential_reflection_blocked".to_string(),
                                 latency_us,
                             });
                             return self.finish_error(
@@ -969,46 +1172,12 @@ impl EdgeGateProxy {
                                 &route.id,
                                 &backend_id,
                                 "ERROR",
-                                EdgeGateError::BadGateway(format!(
-                                    "failed to read upstream response body: {err}"
-                                )),
+                                EdgeGateError::BadGateway(
+                                    "upstream credential reflection blocked".to_string(),
+                                ),
                                 started,
                             );
                         }
-                    };
-                    let body_reflected = body_bytes
-                        .windows(needle.len())
-                        .any(|window| window == needle);
-                    if body_reflected {
-                        let latency_us = started.elapsed().as_micros() as u64;
-                        self.telemetry.record_secret_reflection_blocked();
-                        self.telemetry.record_replay(ReplayRecord {
-                            request_id: req_id,
-                            trace_id: trace_id.clone(),
-                            org_id: identity.org_id.clone(),
-                            workload_id: identity.workload_id.clone(),
-                            method: method.as_str().to_string(),
-                            path: path.clone(),
-                            route: route.id.clone(),
-                            upstream: backend_id.clone(),
-                            status: StatusCode::BAD_GATEWAY.as_u16(),
-                            shadow_status: None,
-                            reason: "credential_reflection_blocked".to_string(),
-                            latency_us,
-                        });
-                        return self.finish_error(
-                            req_id,
-                            &trace_id,
-                            &identity.org_id,
-                            &identity.workload_id,
-                            &route.id,
-                            &backend_id,
-                            "ERROR",
-                            EdgeGateError::BadGateway(
-                                "upstream credential reflection blocked".to_string(),
-                            ),
-                            started,
-                        );
                     }
                     Response::from_parts(
                         parts,
@@ -1072,21 +1241,33 @@ impl EdgeGateProxy {
                     status.as_u16(),
                     latency_us,
                 );
-                let mut mapped = mapped;
+                let (mut parts, body) = mapped.into_parts();
                 for hdr_name in &route.strip_response_headers {
-                    mapped.headers_mut().remove(hdr_name);
+                    parts.headers.remove(hdr_name);
                 }
                 for (hdr_name, hdr_val) in &route.inject_response_headers {
-                    mapped
-                        .headers_mut()
-                        .insert(hdr_name.clone(), hdr_val.clone());
+                    parts.headers.insert(hdr_name.clone(), hdr_val.clone());
                 }
                 if let Ok(trace_val) = HeaderValue::from_str(&trace_id) {
-                    mapped
-                        .headers_mut()
+                    parts
+                        .headers
                         .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
                 }
-                mapped
+                let body = if !route.strip_response_headers.is_empty() {
+                    let strip_headers = route.strip_response_headers.clone();
+                    body.map_frame(move |mut frame| {
+                        if let Some(trailers) = frame.trailers_mut() {
+                            for hdr in &strip_headers {
+                                trailers.remove(hdr);
+                            }
+                        }
+                        frame
+                    })
+                    .boxed()
+                } else {
+                    body
+                };
+                Response::from_parts(parts, body)
             }
             Err(err) => {
                 let latency_us = started.elapsed().as_micros() as u64;
