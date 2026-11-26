@@ -1627,6 +1627,59 @@ pub fn format_amz_timestamps(epoch_secs: u64) -> (String, String) {
     (amz_date, date_stamp)
 }
 
+fn percent_decode_raw(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = bytes[i + 1];
+            let h2 = bytes[i + 2];
+            let d1 = match h1 {
+                b'0'..=b'9' => Some(h1 - b'0'),
+                b'a'..=b'f' => Some(h1 - b'a' + 10),
+                b'A'..=b'F' => Some(h1 - b'A' + 10),
+                _ => None,
+            };
+            let d2 = match h2 {
+                b'0'..=b'9' => Some(h2 - b'0'),
+                b'a'..=b'f' => Some(h2 - b'a' + 10),
+                b'A'..=b'F' => Some(h2 - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(d1), Some(d2)) = (d1, d2) {
+                out.push((d1 << 4) | d2);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Pure-Rust AWS URI encoding according to SigV4 specifications (`RFC 3986`).
+pub fn aws_uri_encode(input: &str, encode_slash: bool) -> String {
+    let raw = percent_decode_raw(input);
+    let mut out = String::with_capacity(raw.len());
+    for b in raw {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b'/' if !encode_slash => {
+                out.push('/');
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
 /// Pure-Rust AWS Signature Version 4 calculation (`AWS4-HMAC-SHA256`, `INV-25`).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_aws_sigv4_headers(
@@ -1644,25 +1697,26 @@ pub fn compute_aws_sigv4_headers(
 ) -> AwsSigV4Headers {
     let content_sha256 = hex::encode(sha256_digest(payload));
     let uri = if canonical_uri.is_empty() {
-        "/"
+        "/".to_string()
     } else {
-        canonical_uri
+        aws_uri_encode(canonical_uri, false)
     };
 
     let sorted_query = match canonical_query {
         Some(q) if !q.is_empty() => {
-            let mut pairs: Vec<(&str, &str)> = q
+            let mut pairs: Vec<(String, String)> = q
                 .split('&')
                 .filter(|s| !s.is_empty())
                 .map(|pair| {
-                    if let Some((k, v)) = pair.split_once('=') {
+                    let (raw_k, raw_v) = if let Some((k, v)) = pair.split_once('=') {
                         (k, v)
                     } else {
                         (pair, "")
-                    }
+                    };
+                    (aws_uri_encode(raw_k, true), aws_uri_encode(raw_v, true))
                 })
                 .collect();
-            pairs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+            pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             pairs
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
@@ -1894,6 +1948,43 @@ value = "ghp_secret_123"
         assert!(h1
             .authorization
             .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn test_aws_sigv4_canonical_query_encodes_reserved_chars() {
+        let raw_query = "prefix=report:2026&b=1";
+        let pre_encoded_query = "b=1&prefix=report%3A2026";
+
+        let h1 = compute_aws_sigv4_headers(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "s3",
+            "GET",
+            "/test.txt",
+            Some(raw_query),
+            "examplebucket.s3.amazonaws.com",
+            b"test payload",
+            "20130524T000000Z",
+            "20130524",
+        );
+
+        let h2 = compute_aws_sigv4_headers(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "s3",
+            "GET",
+            "/test.txt",
+            Some(pre_encoded_query),
+            "examplebucket.s3.amazonaws.com",
+            b"test payload",
+            "20130524T000000Z",
+            "20130524",
+        );
+
+        assert_eq!(h1, h2);
+        assert_eq!(aws_uri_encode("report:2026", true), "report%3A2026");
     }
 
     #[test]

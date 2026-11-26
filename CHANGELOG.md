@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] - 2026-11-26
+
+EdgeGate `v1.1.1` delivers enterprise hardening and production reliability updates across release automation, secret rotation parsing, AWS SigV4 cloud signing, connection pool cache invalidation, CORS compliance, and operator CLI administration.
+
+### Added
+- **Multi-Architecture Release CI on `macos-latest` (`.github/workflows/release.yml`):**
+  - Updated release build matrix to use `macos-latest` for native Apple Silicon (`aarch64-apple-darwin`) compilation, replacing retired `macos-14` runners.
+- **Operator CLI `--admin-token` Support (`edgegate status`, `edgegate replay`):**
+  - Added `--admin-token` CLI flag support across `edgegate status` and `edgegate replay` subcommands, enabling authenticated inspection against multi-tenant gateways configured with `protect_observability = true`.
+
+### Fixed & Hardened
+- **Lossless `serde_json` Secret Rotation Parsing (`POST /_edgegate/admin/secrets/rotate`):**
+  - Upgraded secret rotation payload parsing to lossless `serde_json` deserialization, preserving verbatim special characters, quotes (`"`), colons (`:`), and backslashes (`\`) without delimiter corruption.
+- **AWS SigV4 Signing Hardening (`INV-25`, `[routes.aws_sigv4]`):**
+  - Enforced RFC 3986 URI and query-parameter canonical percent-encoding.
+  - Stripped all incoming caller-forged `x-amz-*` headers, `Authorization`, `x-amz-date`, and `x-amz-content-sha256` fail-closed prior to signing.
+  - Hardened signing safety across traffic shadowing and idempotent retry dispatches, ensuring unique timestamps and payload hashes per transmission.
+- **`allow_private_ip` Warm-Pool Invalidation & Per-Pool DNS TTL Age Checks:**
+  - Evicted and invalidated warm connection pool slots when hot reload toggles `allow_private_ip` from `true` to `false`, preventing warm socket reuse to blocked private/loopback IPs.
+  - Enforced per-pool `dns_cache_ttl_ms` age checks and bounded cache expiration.
+- **CORS Standards Compliance (`INV-27`, `[routes.cors]`):**
+  - Enforced `Vary: Origin` response header presence across all CORS evaluations.
+  - Attached matching CORS headers to error responses (e.g. `401`, `403`, `404`) for authorized origins.
+
+---
+
 ## [1.1.0] - 2026-11-26
 
 EdgeGate `v1.1.0` introduces enterprise scalability, inbound mutual TLS (mTLS), native AWS Signature Version 4 (SigV4) cloud request signing, wait-free hot-path concurrency, warm connection pool reuse across hot reloads, and multi-platform release distribution.

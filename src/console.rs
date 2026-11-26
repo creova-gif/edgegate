@@ -576,7 +576,7 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
       </svg>
       <div class="brand-title-group">
         <h1>EdgeGate Operator Console</h1>
-        <p>Zero-Secret L7 Workload Egress Gateway &amp; Live Verification (v1.1.0)</p>
+        <p>Zero-Secret L7 Workload Egress Gateway &amp; Live Verification (v1.1.1)</p>
       </div>
     </div>
     <div class="header-controls">
@@ -631,6 +631,9 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
           <button id="btn-save-token" type="button" class="btn btn-primary" aria-label="Apply admin token in memory">[Set In-Memory Token]</button>
           <button id="btn-clear-token" type="button" class="btn btn-secondary" aria-label="Clear admin token from memory">[Clear Token]</button>
           <span id="token-status-badge" class="badge badge-dim" aria-label="In-memory token status">[NO TOKEN]</span>
+        </div>
+        <div style="width: 100%; margin-top: 0.5rem;">
+          <label for="allow-cleartext-admin"><input type="checkbox" id="allow-cleartext-admin"> Allow admin token over cleartext HTTP on non-loopback hosts</label>
         </div>
       </div>
     </section>
@@ -860,7 +863,7 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
   <!-- Footer Landmark -->
   <footer class="console-footer">
     <div>
-      <strong>EdgeGate Zero-Secret L7 Security Gateway</strong> &mdash; v1.1.0 High-Assurance Operator Interface
+      <strong>EdgeGate Zero-Secret L7 Security Gateway</strong> &mdash; v1.1.1 High-Assurance Operator Interface
     </div>
     <div>
       <span>WCAG 2.1 AA+ Compliant</span> &bull; <span>Obsidian/Slate Design System</span>
@@ -881,6 +884,7 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
       const themeToggleText = document.getElementById("theme-toggle-text");
       const btnRefresh = document.getElementById("btn-refresh");
       const adminTokenInput = document.getElementById("admin-token-input");
+      const allowCleartextCheckbox = document.getElementById("allow-cleartext-admin");
       const btnSaveToken = document.getElementById("btn-save-token");
       const btnClearToken = document.getElementById("btn-clear-token");
       const tokenStatusBadge = document.getElementById("token-status-badge");
@@ -922,6 +926,15 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
         }
       }
 
+      function announceStatus(msg) {
+        announce(msg);
+      }
+
+      // Cleartext Guard Helper
+      function isCleartextBlocked() {
+        return window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && !window.location.hostname.startsWith('127.') && window.location.hostname !== '::1' && window.location.hostname !== '[::1]' && !allowCleartextCheckbox.checked;
+      }
+
       // Safe Element Creation Helpers (Prevent DOM XSS)
       function createTextCell(text) {
         const td = document.createElement("td");
@@ -959,6 +972,10 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
       // Token Handlers
       btnSaveToken.addEventListener("click", function() {
         const val = adminTokenInput.value.trim();
+        if (isCleartextBlocked()) {
+          announceStatus("Warning: Refusing to send admin token over cleartext HTTP to non-loopback host.");
+          return;
+        }
         if (val.length > 0) {
           inMemoryAdminToken = val;
           tokenStatusBadge.className = "badge badge-ok";
@@ -987,7 +1004,7 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
       // Headers Helper
       function getAuthHeaders() {
         const h = {};
-        if (inMemoryAdminToken) {
+        if (inMemoryAdminToken && !isCleartextBlocked()) {
           h["x-edgegate-admin-token"] = inMemoryAdminToken;
         }
         return h;
@@ -1364,13 +1381,21 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
         const org = rotOrg.value.trim();
         const ref = rotRef.value.trim();
         const val = rotVal.value;
-        const expStr = rotExpires.value.trim();
+        const rawExp = rotExpires.value.trim();
 
         if (!org || !ref || !val) {
           rotateFeedback.style.display = "inline-flex";
           rotateFeedback.className = "badge badge-err";
           rotateFeedback.textContent = "[ERR] Org ID, Credential Ref, and Secret Value are all required.";
           announce("Secret rotation validation error: missing required fields.");
+          return;
+        }
+
+        if (isCleartextBlocked()) {
+          rotateFeedback.style.display = "inline-flex";
+          rotateFeedback.className = "badge badge-err";
+          rotateFeedback.textContent = "[BLOCKED] Cleartext HTTP to non-loopback host blocked.";
+          announceStatus("Warning: Refusing to send rotation payload over cleartext HTTP on non-loopback host.");
           return;
         }
 
@@ -1388,11 +1413,16 @@ static OPERATOR_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
           value: val
         };
 
-        if (expStr.length > 0) {
-          const expNum = parseInt(expStr, 10);
-          if (!isNaN(expNum)) {
-            payload.expires_at_epoch_s = expNum;
+        if (rawExp.length > 0) {
+          var expNum = Number(rawExp);
+          if (!Number.isSafeInteger(expNum) || expNum < 0) {
+            rotateFeedback.style.display = "inline-flex";
+            rotateFeedback.className = "badge badge-err";
+            rotateFeedback.textContent = "[ERR] Expiry must be a non-negative integer timestamp.";
+            announceStatus('Error: expiry must be a non-negative integer timestamp.');
+            return;
           }
+          payload.expires_at_epoch_s = expNum;
         }
 
         try {
@@ -1490,6 +1520,9 @@ mod tests {
         assert!(html.contains("<label for=\"admin-token-input\""));
         assert!(html.contains("id=\"admin-token-input\""));
         assert!(html.contains("aria-describedby=\"auth-desc\""));
+        assert!(html.contains("<label for=\"allow-cleartext-admin\"><input type=\"checkbox\" id=\"allow-cleartext-admin\"> Allow admin token over cleartext HTTP on non-loopback hosts</label>"));
+        assert!(html.contains("isCleartextBlocked"));
+        assert!(html.contains("Number.isSafeInteger"));
         assert!(html.contains("<label for=\"rot-org\""));
         assert!(html.contains("<label for=\"rot-ref\""));
         assert!(html.contains("<label for=\"rot-val\""));

@@ -33,7 +33,7 @@ Following the General Availability release of EdgeGate (`v1.0.0`), deployment ac
 - **Wait-Free Secret & Bulkhead Lookups:**
   Migrate internal lookup tables in `SecretProvider` and `WorkloadAuthenticator` to `ArcSwap<Arc<HashMap<...>>>` (or lock-free map structures). Hot-path reads (`get_secret`, workload bulkhead lookups) load an immutable reference without acquiring a `std::sync::Mutex` or `RwLock`. Updates (secret rotation, config hot reload) construct a new map off the hot path and swap the pointer atomically via `ArcSwap::store`.
 - **Bounded SSRF-Validated DNS Cache (`dns_cache_ttl_ms`):**
-  Introduce an optional `dns_cache_ttl_ms: Option<u64>` on `[server]` (default disabled / 0). When configured, EdgeGate caches the resolved and SSRF-validated `Vec<SocketAddr>` for each upstream `(host, port)` up to the configured TTL. Subsequent dials within the TTL use the pre-validated addresses without re-invoking DNS lookups, while still validating IP blocklists upon cache insertion to preserve anti-SSRF invariants (`INV-07`).
+  Introduce `dns_cache_ttl_ms: u64` on `[[pools]]` (default `10000` ms). When configured, EdgeGate caches the resolved and SSRF-validated `Vec<SocketAddr>` for each upstream `(host, port)` up to the pool's configured TTL. Subsequent dials within the TTL use the pre-validated addresses without re-invoking DNS lookups, while still validating IP blocklists upon cache insertion to preserve anti-SSRF invariants (`INV-07`).
 - **Warm Connection Pool Reuse Across Hot Reloads:**
   When `RuntimeSnapshot` compiles a new configuration during hot reload, `ConnectionPool` matches surviving `(pool_name, backend_id)` slots with unchanged network parameters (`address`, `tls`, `http2`, `mtls`). Surviving `UpstreamSlot` instances retain their active HTTP/2 multiplexed connections and idle HTTP/1.1 pools, eliminating cold-start reconnections and TLS handshakes during dynamic policy and route updates.
 
@@ -55,8 +55,13 @@ Following the General Availability release of EdgeGate (`v1.0.0`), deployment ac
 
 ### 3. Outbound AWS Signature Version 4 (`SigV4`) Cloud Request Signing (`INV-25`, [../../src/config.rs](../../src/config.rs), [../../src/router.rs](../../src/router.rs), [../../src/proxy.rs](../../src/proxy.rs))
 - **Configuration Schema:**
-  Add optional `[routes.aws_sigv4]` to `[[routes]]`:
+  Add optional `[routes.aws_sigv4]` as its own clean route definition (or note it replaces `[routes.credential]` and `[routes.request_signing]` on `Authorization`):
   ```toml
+  [[routes]]
+  id = "s3-route"
+  path_prefix = "/v1/s3"
+  pool = "s3-pool"
+
   [routes.aws_sigv4]
   access_key_ref = "aws_access_key_id"      # Org-scoped secret in [[secrets]]
   secret_key_ref = "aws_secret_access_key"  # Org-scoped secret in [[secrets]]
@@ -100,9 +105,9 @@ Following the General Availability release of EdgeGate (`v1.0.0`), deployment ac
 
 ### 6. Route-Level CORS Preflight & Browser/MCP Interoperability (`INV-27`, [../../src/config.rs](../../src/config.rs), [../../src/router.rs](../../src/router.rs), [../../src/proxy.rs](../../src/proxy.rs))
 - **Declarative Route-Level Configuration (`[routes.cors]`):**
-  Enables granular CORS policies per route with `allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, and `max_age_s`.
+  Enables granular CORS policies per route with `allowed_origins`, `allowed_methods`, `allowed_headers`, `expose_headers`, and `max_age_secs`.
 - **Compile-Time Origin Validation:**
-  Validation forbids wildcards (`allow_origins = ["*"]`) when `allow_credentials = true`, preventing browser credential-leak vulnerabilities.
+  Validation strictly forbids empty origins or wildcard origin `allowed_origins = ["*"]`, preventing browser data and credential exposure vulnerabilities.
 - **Zero-Secret Preflight Short-Circuiting:**
   `OPTIONS` requests matching a CORS-enabled route are intercepted at the routing layer before authentication, policy evaluation, or backend checkout. Requests from authorized origins immediately return `204 No Content` with appropriate `Access-Control-Allow-*` and `Vary: Origin` headers, preventing unauthorized credential injection or upstream socket allocation.
 
@@ -154,4 +159,4 @@ The `2.36x` throughput gain and `-50.9%` reduction in p95 latency overhead direc
 - **Expired Client CA Certificates:**
   If the configured `client_ca_cert_path` expires or client certificates expire, inbound handshakes will fail at the TLS layer. *Mitigation:* Monitor certificate expiration and rotate CA bundles live via atomic hot reload.
 - **DNS Cache Stale Addresses:**
-  If `dns_cache_ttl_ms` is configured with an excessively long TTL, dynamic upstream IP failover may take up to the TTL duration to discover new endpoints. *Mitigation:* Operators should choose moderate TTLs (e.g., 30–60 seconds) matching upstream DNS records.
+  If `dns_cache_ttl_ms` on `[[pools]]` is configured with an excessively long TTL, dynamic upstream IP failover may take up to the TTL duration to discover new endpoints. *Mitigation:* Operators should choose moderate TTLs (e.g., default 10,000 ms / 10 seconds, or 30–60 seconds) matching upstream DNS records.

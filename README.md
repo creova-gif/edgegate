@@ -1,7 +1,7 @@
 # EdgeGate
 
 [![CI](https://github.com/creova-gif/edgegate/actions/workflows/ci.yml/badge.svg)](https://github.com/creova-gif/edgegate/actions/workflows/ci.yml)
-[![Version: v1.1.0](https://img.shields.io/badge/version-v1.1.0-blue.svg)](https://github.com/creova-gif/edgegate/releases)
+[![Version: v1.1.1](https://img.shields.io/badge/version-v1.1.1-blue.svg)](https://github.com/creova-gif/edgegate/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Rust: 1.85+](https://img.shields.io/badge/rust-2021%20edition%20%7C%201.85%2B-orange.svg)](Cargo.toml)
 [![Security Invariants: INV-01..INV-27](https://img.shields.io/badge/security%20invariants-INV--01..INV--27-brightgreen.svg)](SECURITY.md)
@@ -21,7 +21,7 @@
 - [Architecture Overview](#architecture-overview)
 - [Installation](#installation)
 - [Quickstart & Operator CLI](#quickstart--operator-cli)
-- [Capabilities Matrix (v1.1.0)](#capabilities-matrix-v110)
+- [Capabilities Matrix (v1.1.1)](#capabilities-matrix-v111)
 - [Configuration Reference (edgegate.toml)](#configuration-reference-edgegatetoml)
 - [Observability & Admin Control Plane](#observability--admin-control-plane)
 - [Container Zero-Bypass Demo](#container-zero-bypass-demo)
@@ -46,7 +46,7 @@ EdgeGate solves this at the systems layer:
 
 ## Industry Comparison Matrix
 
-| Capability / Architecture Property | EdgeGate (`v1.1.0`) | General-Purpose L7 Proxies<br>(Envoy / Kong / Traefik) | MITM Forward Proxies<br>(`HTTP_PROXY` / Squid / mitmproxy) |
+| Capability / Architecture Property | EdgeGate (`v1.1.1`) | General-Purpose L7 Proxies<br>(Envoy / Kong / Traefik) | MITM Forward Proxies<br>(`HTTP_PROXY` / Squid / mitmproxy) |
 |---|---|---|---|
 | **Zero-Secret UDS Sandbox Identity**<br>(`[[server.unix_listeners]]`, `register_boxlet_sandbox`) | **Native & First-Class:** Dedicated per-sandbox Unix domain sockets bind tenant identity at the OS boundary; workloads hold zero bearer tokens or certificates. | **Partial / Complex:** Requires external control plane (Envoy SDS, SPIFFE/SPIRE agent) or custom Lua/Wasm plugins; TCP listeners predominate. | **Unsupported:** Relies on cleartext/basic proxy auth headers (`Proxy-Authorization`) holding credentials inside guest environment. |
 | **Scoped Credential Injection & Signing**<br>(`INV-05`, `INV-23` HMAC-SHA256, `INV-25` AWS SigV4) | **Native & Org-Scoped:** Injects scoped API keys, RFC 2104 HMAC-SHA256 signatures, and AWS SigV4 signatures with fail-closed TTL validation (`INV-14`). | **Limited / Add-On:** Requires external vault sidecars, enterprise plugins (Kong Enterprise), or custom Wasm/Lua scripts; lacks integrated TTL governance. | **Unsupported:** Blindly tunnels traffic (`CONNECT`) or forwards client-supplied credentials; cannot dynamically synthesize AWS SigV4 or HMAC signatures. |
@@ -119,16 +119,16 @@ For a deep dive into the internal state machines, connection pool invariants, an
 Download locked, statically compiled binaries and integrity checksums from the [EdgeGate Releases](https://github.com/creova-gif/edgegate/releases) page:
 
 ```bash
-# Example: Download and extract v1.1.0 for Linux x86_64 or macOS Apple Silicon (aarch64)
+# Example: Download and extract v1.1.1 for Linux x86_64 or macOS Apple Silicon (aarch64)
 TARGET="x86_64-unknown-linux-gnu" # or "aarch64-apple-darwin" for macOS Apple Silicon
-curl -fsSLO "https://github.com/creova-gif/edgegate/releases/download/v1.1.0/edgegate-v1.1.0-${TARGET}.tar.gz"
-curl -fsSLO "https://github.com/creova-gif/edgegate/releases/download/v1.1.0/SHA256SUMS"
+curl -fsSLO "https://github.com/creova-gif/edgegate/releases/download/v1.1.1/edgegate-v1.1.1-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/creova-gif/edgegate/releases/download/v1.1.1/SHA256SUMS"
 
 # Verify binary integrity against published SHA256SUMS BEFORE extraction
 sha256sum --ignore-missing -c SHA256SUMS # or on macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
 
 # Extract and install binary
-tar -xzf "edgegate-v1.1.0-${TARGET}.tar.gz"
+tar -xzf "edgegate-v1.1.1-${TARGET}.tar.gz"
 sudo mv edgegate /usr/local/bin/
 edgegate --version
 ```
@@ -195,7 +195,7 @@ cargo test --all-targets
 
 ---
 
-## Capabilities Matrix (v1.1.0)
+## Capabilities Matrix (v1.1.1)
 
 | Milestone | Subsystem | Key Capabilities |
 |---|---|---|
@@ -209,7 +209,7 @@ cargo test --all-targets
 | **Milestone 8 (`v0.8.0`)** | **Outbound mTLS Client Auth, Egress DLP Payload Guard, Programmable Response Header Hardening & Admin Pool Introspection** | • Outbound Mutual TLS (mTLS) Client Authentication (`INV-18`): per-pool `client_cert_pem` + `client_key_pem` validated via `rustls` / `rustls-pemfile` so EdgeGate presents client certificates during upstream TLS 1.2/1.3 handshakes with zero private keys in the sandbox<br>• Egress Data Loss Prevention (DLP) Payload Guard (`INV-19`): per-rule `blocked_body_substrings` inspecting bounded outbound request bodies before upstream dispatch, rejecting exfiltration attempts fail-closed with `403 Forbidden`, incrementing `dlp_blocked_total` (`edgegate_dlp_blocked_total`), and recording sanitized `dlp_payload_blocked` replay entries<br>• Programmable Response Header Stripping & Security Header Injection: route-level `strip_response_headers` and `inject_response_headers` to scrub upstream server fingerprinting headers and enforce security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control`)<br>• Admin Pool & Circuit-Breaker Topology Introspection (`GET /_edgegate/admin/pools`) & CLI `edgegate audit`: live authenticated inspection of per-pool strategy, mTLS status, backend weights, active health, EWMA latency, and 3-state circuit breakers (`closed`, `open`, `half_open`), plus the `edgegate audit` CLI subcommand |
 | **Milestone 9 (`v0.9.0`)** | **Workload Bulkheads, JSON-RPC/MCP Allowlisting, Route SLAs & Protocol Hardening** | • Per-Workload Concurrency Quotas & Bulkheads (`INV-20`, `max_concurrent_requests` on `[[workloads]]` and `[[server.unix_listeners]]`): Semaphore-backed per-`(org_id, workload_id)` in-flight concurrency caps on TCP and zero-token Unix socket workloads, returning `429 Too Many Requests` (`Retry-After: 1`, `edgegate_bulkhead_rejected_total`)<br>• Per-Route Request Timeout Overrides & Upstream Response Body Caps (`INV-21`, `timeout_ms`, `max_response_body_bytes` on `[[routes]]`): Granular route response timeout SLAs (`504 Gateway Timeout` on timeout) and bounded upstream response payload enforcement (`502 Bad Gateway` on overflow)<br>• JSON-RPC 2.0 / MCP Tool-Call Method Allowlisting (`INV-22`, `allowed_jsonrpc_methods` on `[[policies]]`): RFC 8259 `serde_json` inspection of single and batch JSON-RPC 2.0 requests prior to backend checkout, blocking unauthorized MCP tool execution (`403 Forbidden`, `edgegate_jsonrpc_blocked_total`)<br>• Protocol & Control-Plane Hardening: Active HTTP/2 (`h2`/`h2c`/mTLS) health probing, HTTP/2 response trailer scrubbing (`strip_response_headers` applied to headers and trailers), and verified HTTPS (`--ca-cert`) + environment-variable token (`EDGEGATE_ADMIN_TOKEN`) + client-side SHA-256 hash-chain verification in `edgegate audit` |
 | **Milestone 10 (`v1.0.0` GA)** | **HMAC Request Signing, Stream-Lifetime Bulkheads, Trailer Preservation & Production Packaging** | • Outbound Cryptographic Request Signing — HMAC-SHA256 (`INV-23`, `[routes.request_signing]`): Pure-Rust RFC 2104 HMAC-SHA256 signing (`X-EdgeGate-Timestamp` + `X-EdgeGate-Signature-256: sha256=<hex>` over `<timestamp>.<raw_body>`) backed by org-scoped `SecretProvider` with fail-closed TTL enforcement (`INV-14`), forged header stripping, and `signed_requests_total` metric<br>• Stream-Lifetime Workload Bulkhead & Graceful-Drain Guards (`INV-20` Hardening): Live-reload persistent `Arc<AtomicUsize>` counters paired with `GuardedResponseBody` holding both `WorkloadBulkheadGuard` and `InFlightGuard` until streaming response EOF or drop, protecting SSE, gRPC, and chunked streams<br>• Trailer-Preserving Response Caps & Breaker Fault Isolation (`INV-21` Hardening): Preserves HTTP/2 trailers (`grpc-status`) through `BufferedBodyWithTrailers` and scrubs trailers via `strip_response_headers`; isolates `http_body_util::LengthLimitError` (`502 Bad Gateway`) from tripping shared backend circuit breakers<br>• Strict JSON-RPC 2.0 Envelope Validation & Explicit Empty Allowlist (`INV-22` Hardening): `Option<Vec<String>>` semantics where `allowed_jsonrpc_methods = []` enforces fail-closed deny-all (`403 Forbidden`) and mandatory `"jsonrpc": "2.0"` envelope validation is required on all single and batch objects<br>• CLI Cleartext Admin Credential Protection & Production Packaging: `edgegate audit` refuses cleartext `http://` transport to non-loopback hosts without `--allow-insecure-http`, rejects `--ca-cert` on `http://` URLs, and packages deterministic GitHub Release binaries |
-| **Milestone 11 (`v1.1.0`)** | **Enterprise Scalability, Inbound mTLS, AWS SigV4, Web Console & Browser Interoperability** | • Inbound Mutual TLS (mTLS) Client Verification (`INV-24`, `[server.tls]` `client_ca_cert_pem` / `client_ca_cert_path`): Hardware/sidecar X.509 client certificate validation at the inbound TLS listener via `rustls::server::WebPkiClientVerifier`, with `--client-cert` / `--client-key` CLI support<br>• Outbound AWS Signature Version 4 (SigV4) Cloud Request Signing (`INV-25`, `[routes.aws_sigv4]`): Zero-secret canonical AWS SigV4 signing (`AWS4-HMAC-SHA256`, `x-amz-date`, `x-amz-content-sha256`) for S3, Bedrock, DynamoDB, R2, and MinIO backends with automatic stripping of caller-forged `Authorization` and `x-amz-*` headers<br>• Wait-Free Hot-Path Concurrency & Warm Pool Reuse: Lock-free `ArcSwap` secret and bulkhead lookups eliminating `Mutex` contention, bounded SSRF-validated DNS cache (`dns_cache_ttl_ms`), and warm `UpstreamSlot` connection pool reuse across atomic `ArcSwap` hot reloads delivering **2.36x throughput gain** (`64,854.4 req/s`) and **-50.9% added p95 latency reduction** (`+445 µs`)<br>• Embedded WCAG 2.1 AA+ Operator Web Console (`INV-26`, `GET /_edgegate/console`, `src/console.rs`): Zero-dependency control-plane console with adaptive dark/light high-contrast themes (>= 7:1), keyboard skip-links, WAI-ARIA live regions, strict CSP, and memory-only token handling<br>• Route-Level CORS Preflight & Browser/MCP Interoperability (`INV-27`, `[routes.cors]`): Granular origin allowlists forbidding wildcard `*` with credentials, zero-secret `OPTIONS` preflight short-circuiting (`204 No Content`), `Vary: Origin`, and `Access-Control-Expose-Headers`<br>• W3C `tracestate` Interoperability (`src/router.rs`): Level 1 validation (printable ASCII, `<= 512` bytes, `<= 32` members) and upstream/shadow propagation alongside `traceparent`<br>• Optional Observability Authentication (`protect_observability = true`) & Trailer Secret-Reflection Scanning (`INV-12` Hardening): Restricts `/_edgegate/metrics` and `/_edgegate/replay` behind `X-EdgeGate-Admin-Token` while keeping `/_edgegate/healthz` open for orchestrators, and intercepts reflected credentials in HTTP/2 trailers |
+| **Milestone 11 (`v1.1.1`)** | **Enterprise Scalability, Inbound mTLS, AWS SigV4, Web Console & Browser Interoperability** | • Inbound Mutual TLS (mTLS) Client Verification (`INV-24`, `[server.tls]` `client_ca_cert_pem` / `client_ca_cert_path`): Hardware/sidecar X.509 client certificate validation at the inbound TLS listener via `rustls::server::WebPkiClientVerifier`, with `--client-cert` / `--client-key` CLI support<br>• Outbound AWS Signature Version 4 (SigV4) Cloud Request Signing (`INV-25`, `[routes.aws_sigv4]`): Zero-secret canonical AWS SigV4 signing (`AWS4-HMAC-SHA256`, `x-amz-date`, `x-amz-content-sha256`) for S3, Bedrock, DynamoDB, R2, and MinIO backends with automatic stripping of caller-forged `Authorization` and `x-amz-*` headers<br>• Wait-Free Hot-Path Concurrency & Warm Pool Reuse: Lock-free `ArcSwap` secret and bulkhead lookups eliminating `Mutex` contention, bounded SSRF-validated DNS cache (`dns_cache_ttl_ms`), and warm `UpstreamSlot` connection pool reuse across atomic `ArcSwap` hot reloads delivering **2.36x throughput gain** (`64,854.4 req/s`) and **-50.9% added p95 latency reduction** (`+445 µs`)<br>• Embedded WCAG 2.1 AA+ Operator Web Console (`INV-26`, `GET /_edgegate/console`, `src/console.rs`): Zero-dependency control-plane console with adaptive dark/light high-contrast themes (>= 7:1), keyboard skip-links, WAI-ARIA live regions, strict CSP, and memory-only token handling<br>• Route-Level CORS Preflight & Browser/MCP Interoperability (`INV-27`, `[routes.cors]`): Granular origin allowlists forbidding wildcard `*` with credentials, zero-secret `OPTIONS` preflight short-circuiting (`204 No Content`), `Vary: Origin`, and `Access-Control-Expose-Headers`<br>• W3C `tracestate` Interoperability (`src/router.rs`): Level 1 validation (printable ASCII, `<= 512` bytes, `<= 32` members) and upstream/shadow propagation alongside `traceparent`<br>• Optional Observability Authentication (`protect_observability = true`) & Trailer Secret-Reflection Scanning (`INV-12` Hardening): Restricts `/_edgegate/metrics` and `/_edgegate/replay` behind `X-EdgeGate-Admin-Token` while keeping `/_edgegate/healthz` open for orchestrators, and intercepts reflected credentials in HTTP/2 trailers |
 
 ---
 
@@ -223,7 +223,6 @@ connect_timeout_ms = 2000          # Upstream TCP + TLS + HTTP handshake timeout
 response_timeout_ms = 10000        # Upstream response header timeout (504 on timeout)
 drain_timeout_ms = 5000            # Graceful shutdown drain window for in_flight_requests (Milestone 5)
 replay_buffer_size = 64            # Bounded flight-recorder ring buffer capacity for /_edgegate/replay
-dns_cache_ttl_ms = 60000          # Optional bounded TTL DNS cache for SSRF-validated sockets (Milestone 11)
 protect_observability = true       # Optional gate /metrics and /replay behind admin_token in multi-tenant setups (Milestone 11)
 # Optional Admin Control Plane token (`admin_token` or 64-hex-char `admin_token_sha256`, Milestone 7).
 # When omitted, all `/_edgegate/admin/*` endpoints fail closed.
@@ -265,6 +264,7 @@ passive_failure_threshold = 3      # Consecutive 502/504/5xx failures before tri
 passive_cooldown_ms = 5000         # Cooldown in Open state before admitting single-flight HalfOpen probe
 max_idempotent_retries = 1         # Retries safe methods (GET/HEAD/OPTIONS) on connect/transport errors across healthy backends
 allow_private_ip = false           # Keep false in production to enforce full IPv4/IPv6/mapped-v6 SSRF blocklist
+dns_cache_ttl_ms = 10000          # Optional bounded TTL DNS cache for SSRF-validated sockets (default 10000 ms, Milestone 11)
 health_check_path = "/healthz"     # Optional background active HTTP health probe path
 health_check_interval_ms = 5000
 # Optional outbound Mutual TLS (mTLS) client certificate & private key (INV-18, Milestone 8).
@@ -280,6 +280,7 @@ backends = [
 name = "github-canary"
 strategy = "consistent_hash"
 allow_private_ip = false
+dns_cache_ttl_ms = 10000
 backends = [
   { id = "gh-canary-1", address = "canary.api.github.com:443", tls = true, http2 = true },
 ]
@@ -303,28 +304,34 @@ block_secret_reflection = true     # Blocks 502 Bad Gateway if upstream reflects
 
 # Optional Outbound Cryptographic Request Signing (INV-23, Milestone 10 / v1.0.0 GA).
 # Signs outbound payload using pure-Rust RFC 2104 HMAC-SHA256, stripping incoming caller-forged headers.
+# Note: Mutually exclusive with [routes.aws_sigv4] on the same route.
 [routes.request_signing]
 credential_ref = "webhook_hmac_key"          # Resolves org-scoped secret in [[secrets]]
 signature_header = "X-EdgeGate-Signature-256" # Header populated with sha256=<hex_digest>
 timestamp_header = "X-EdgeGate-Timestamp"     # Header populated with Unix epoch seconds
 
-# Optional Outbound AWS Signature Version 4 (SigV4) Signing (INV-25, Milestone 11 / v1.1.0).
+# Clean Route Example with Outbound AWS Signature Version 4 (SigV4) Signing (INV-25, Milestone 11 / v1.1.1).
 # Signs outbound requests to S3, Bedrock, DynamoDB, R2, or MinIO using canonical AWS SigV4.
-# [routes.aws_sigv4]
-# access_key_ref = "aws_access_key"            # Resolves org-scoped AWS access key in [[secrets]]
-# secret_key_ref = "aws_secret_key"            # Resolves org-scoped AWS secret key in [[secrets]]
-# region = "us-east-1"
-# service = "s3"
+# Note: Replaces [routes.credential] and [routes.request_signing] on Authorization / header signatures.
+[[routes]]
+id = "aws-s3-api"
+path_prefix = "/v1/s3"
+strip_prefix = true
+pool = "github-primary"
+[routes.aws_sigv4]
+access_key_ref = "aws_access_key"            # Resolves org-scoped AWS access key in [[secrets]]
+secret_key_ref = "aws_secret_key"            # Resolves org-scoped AWS secret key in [[secrets]]
+region = "us-east-1"
+service = "s3"
 
-# Optional Route-Level CORS Preflight & Browser/MCP Interoperability (INV-27, Milestone 11 / v1.1.0).
+# Optional Route-Level CORS Preflight & Browser/MCP Interoperability (INV-27, Milestone 11 / v1.1.1).
 # Short-circuits OPTIONS requests with 204 No Content before upstream connection checkout or secret injection.
-# [routes.cors]
-# allow_origins = ["https://console.internal", "https://agent.example.com"]
-# allow_methods = ["GET", "POST", "OPTIONS"]
-# allow_headers = ["Authorization", "Content-Type", "X-EdgeGate-Token", "X-MCP-Tool"]
-# expose_headers = ["X-EdgeGate-Timestamp", "X-EdgeGate-Signature-256"]
-# allow_credentials = true
-# max_age_s = 86400
+[routes.cors]
+allowed_origins = ["https://console.internal", "https://agent.example.com"]
+allowed_methods = ["GET", "POST", "OPTIONS"]
+allowed_headers = ["Authorization", "Content-Type", "X-EdgeGate-Token", "X-MCP-Tool"]
+expose_headers = ["X-EdgeGate-Timestamp", "X-EdgeGate-Signature-256"]
+max_age_secs = 86400
 
 [[policies]]
 org_id = "org-alpha"
@@ -422,7 +429,7 @@ edgegate/
 ├── ARCHITECTURE.md             # In-depth systems architecture, state machines, and RFC implementations
 ├── SECURITY.md                 # Security policy, vulnerability reporting, and 27 enforced invariants (INV-01..INV-27)
 ├── CONTRIBUTING.md             # Developer guidelines, coding standards, and PR workflows
-├── CHANGELOG.md                # Detailed version history and release notes from v0.1.0 to v1.1.0
+├── CHANGELOG.md                # Detailed version history and release notes from v0.1.0 to v1.1.1
 ├── LICENSE                     # MIT Open Source License
 ├── edgegate.demo.toml          # Annotated production reference configuration
 ├── docker-compose.demo.yml     # Multi-container zero-bypass security proof topology
