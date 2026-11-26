@@ -69,6 +69,7 @@ pub struct Telemetry {
     jsonrpc_blocked_total: AtomicU64,
     retries_total: AtomicU64,
     in_flight_requests: AtomicU64,
+    signed_requests_total: AtomicU64,
     latency_le_100us: AtomicU64,
     latency_le_500us: AtomicU64,
     latency_le_1000us: AtomicU64,
@@ -100,6 +101,7 @@ pub struct TelemetrySnapshot {
     pub jsonrpc_blocked_total: u64,
     pub retries_total: u64,
     pub in_flight_requests: u64,
+    pub signed_requests_total: u64,
 }
 
 impl Default for Telemetry {
@@ -133,6 +135,7 @@ impl Telemetry {
             jsonrpc_blocked_total: AtomicU64::new(0),
             retries_total: AtomicU64::new(0),
             in_flight_requests: AtomicU64::new(0),
+            signed_requests_total: AtomicU64::new(0),
             latency_le_100us: AtomicU64::new(0),
             latency_le_500us: AtomicU64::new(0),
             latency_le_1000us: AtomicU64::new(0),
@@ -169,6 +172,10 @@ impl Telemetry {
 
     pub fn record_retry(&self) {
         self.retries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_signed_request(&self) {
+        self.signed_requests_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_secret_reflection_blocked(&self) {
@@ -274,6 +281,7 @@ impl Telemetry {
             jsonrpc_blocked_total: self.jsonrpc_blocked_total.load(Ordering::Relaxed),
             retries_total: self.retries_total.load(Ordering::Relaxed),
             in_flight_requests: self.in_flight_requests.load(Ordering::Acquire),
+            signed_requests_total: self.signed_requests_total.load(Ordering::Relaxed),
         }
     }
 
@@ -281,7 +289,7 @@ impl Telemetry {
         let s = self.snapshot();
         let audit_valid = self.verify_audit_chain();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"dlp_blocked_total\":{},\"bulkhead_rejected_total\":{},\"jsonrpc_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"audit_chain_valid\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"dlp_blocked_total\":{},\"bulkhead_rejected_total\":{},\"jsonrpc_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{},\"signed_requests_total\":{},\"audit_chain_valid\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -298,6 +306,7 @@ impl Telemetry {
             s.jsonrpc_blocked_total,
             s.retries_total,
             s.in_flight_requests,
+            s.signed_requests_total,
             audit_valid
         )
     }
@@ -362,6 +371,9 @@ impl Telemetry {
              # HELP edgegate_in_flight_requests Current number of in-flight requests being processed.\n\
              # TYPE edgegate_in_flight_requests gauge\n\
              edgegate_in_flight_requests {}\n\
+             # HELP edgegate_signed_requests_total Total outbound requests cryptographically signed with HMAC-SHA256.\n\
+             # TYPE edgegate_signed_requests_total counter\n\
+             edgegate_signed_requests_total {}\n\
              # HELP edgegate_request_duration_microseconds Request latency histogram in microseconds.\n\
              # TYPE edgegate_request_duration_microseconds histogram\n\
              edgegate_request_duration_microseconds_bucket{{le=\"100\"}} {}\n\
@@ -389,6 +401,7 @@ impl Telemetry {
             s.jsonrpc_blocked_total,
             s.retries_total,
             s.in_flight_requests,
+            s.signed_requests_total,
             b100,
             b500,
             b1000,

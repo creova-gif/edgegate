@@ -61,26 +61,30 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     Acquires RAII `BackendLease` (`Closed` / `Open` / `HalfOpen` probe)    ║
 ║     ▼                                                                        ║
 ║  [Step 8] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
-║     │     Strips hop-by-hop, `X-EdgeGate-Token`, `Proxy-Authorization`, forged   ║
-║     │     auth headers; verifies secret TTL (`expires_at_epoch_s`, `403` on      ║
-║     │     expiry) and injects W3C `traceparent` + `(org_id, credential_ref)`     ║
-║     ▼                                                                        ║
+║     │     Strips hop-by-hop, `X-EdgeGate-Token`, forged auth, & HMAC signature/  ║
+║     │     timestamp headers; verifies secret TTL (`expires_at_epoch_s`, `403`    ║
+║     │     on expiry) and injects W3C `traceparent`, `(org_id, credential_ref)`,  ║
+║     │     & outbound HMAC-SHA256 request signing (`INV-23`)                      ║
+║     ▼                                                                            ║
 ║  [Step 9] Bounded Connection Pool + Outbound mTLS (`INV-18`) + SSRF + Failover   ║
 ║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
 ║     │     • Outbound TLS 1.2/1.3 & optional Mutual TLS (`client_cert_pem` +      ║
 ║     │       `client_key_pem`), HTTP/1.1 `PooledBody` guard or HTTP/2 `h2`        ║
 ║     │     • Controlled failover (`max_idempotent_retries`) for `GET`/`HEAD`/     ║
 ║     │       `OPTIONS` only; never follows `3xx` or retries state-mutating verbs  ║
-║     ▼                                                                        ║
-║  [Step 10] Response Reflection Guard, Route SLAs & Audit Chain (INV-16/21/22) ║
-║           • Enforces route timeout_ms SLA (504) & max_response_body_bytes     ║
-║             ceiling (502 Bad Gateway on overflow, INV-21)                    ║
-║           • When `block_secret_reflection = true`, inspects upstream response ║
-║             headers and body; blocks leaked secrets with `502 Bad Gateway`    ║
-║           • Applies route `strip_response_headers` (headers and trailers)     ║
-║             & `inject_response_headers`                                      ║
-║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->          ║
-║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram ║
+║     ▼                                                                            ║
+║  [Step 10] Response Guard, Route SLAs, Streaming Bulkheads & Audit Chain         ║
+║           • Enforces route timeout_ms SLA (504) & max_response_body_bytes       ║
+║             ceiling with trailer preservation (`BufferedBodyWithTrailers`, 502   ║
+║             on overflow, isolates `LengthLimitError` from circuit breaker)       ║
+║           • `GuardedResponseBody` retains bulkhead & drain guards through stream ║
+║             EOF/drop (INV-20), protecting SSE, gRPC & chunked streams            ║
+║           • When `block_secret_reflection = true`, inspects upstream response   ║
+║             headers and body; blocks leaked secrets with `502 Bad Gateway`       ║
+║           • Applies route `strip_response_headers` (headers and trailers)       ║
+║             & `inject_response_headers`                                          ║
+║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->             ║
+║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram    ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
                     │ Primary Dispatch                         │ Async Non-Blocking Clone
                     ▼                                          ▼
@@ -387,3 +391,39 @@ Modern AI agent systems increasingly interact with tools via JSON-RPC 2.0 and th
 - **Active HTTP/2 Health Probing:** Active background health probes honor `backend.http2 = true`. For HTTP/2 backends, health checks negotiate ALPN `h2` (or `h2c` prior knowledge) and issue HTTP/2 `GET` probes on multiplexed streams, ensuring that backend circuit breakers only remain `Closed` when HTTP/2 framing is verified end-to-end.
 - **HTTP/2 Response Trailer Scrubbing:** EdgeGate applies route `strip_response_headers` to both HTTP/2 initial response headers and trailing headers (trailers), ensuring that backends cannot bypass header stripping by emitting sensitive headers as trailers.
 - **Hardened Operator Audit CLI (`edgegate audit`):** The `edgegate audit` CLI supports the `EDGEGATE_ADMIN_TOKEN` environment variable and `--ca-cert <PATH>` for verified HTTPS administration. The CLI recomputes the SHA-256 hash chain from genesis through all records to the head hash client-side, terminating with an error if cryptographic tampering is detected.
+
+---
+
+## 14. Outbound Cryptographic Request Signing (HMAC-SHA256), Stream-Lifetime Bulkheads, Trailer Preservation & Production Hardening (`Milestone 10` / `v1.0.0 GA`)
+
+### Outbound Cryptographic Request Signing — HMAC-SHA256 (`INV-23`, `[routes.request_signing]`)
+Modern AI agent architectures frequently interact with external webhooks, API gateways, and microservices that mandate cryptographic request verification (e.g. GitHub Webhooks, Slack, Stripe, AWS SigV4). When sandboxes execute untrusted code or run prompt-driven tool pipelines, providing the sandbox with raw HMAC signing keys compromises origin authenticity.
+- **Declarative Route Signing Configuration:** Routes (`[[routes]]`) support optional `[routes.request_signing]`:
+  ```toml
+  [routes.request_signing]
+  key_ref = "webhook_hmac_key"              # Resolves org-scoped secret in [[secrets]]
+  algorithm = "hmac_sha256"                 # Validated pure-Rust RFC 2104 HMAC-SHA256
+  header_name = "X-EdgeGate-Signature-256"  # Header receiving sha256=<hex_digest>
+  timestamp_header = "X-EdgeGate-Timestamp" # Header receiving Unix epoch seconds
+  ```
+- **Forged Signature Stripping:** In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), EdgeGate unconditionally strips incoming caller-provided `X-EdgeGate-Signature-256` and `X-EdgeGate-Timestamp` headers prior to signature generation, ensuring that sandboxes cannot forge or manipulate outbound cryptographic signatures.
+- **Fail-Closed Secret & TTL Resolution:** The signing key is retrieved from `SecretProvider` scoped to `(identity.org_id, signing.key_ref)`. If the secret is missing or has expired according to its `expires_at_epoch_s` TTL, EdgeGate immediately rejects the request fail-closed with `403 Forbidden` (`INV-14`).
+- **Canonical Envelope & Hex Computation:** EdgeGate captures the current Unix epoch timestamp in seconds, constructs the canonical signing buffer `<timestamp>.<raw_body>` (using an empty byte slice for empty bodies), computes the RFC 2104 HMAC-SHA256 digest, formats the header value as `sha256=<lowercase_hex>`, and injects both the timestamp and signature headers onto the outbound request.
+- **Telemetry:** Every signed dispatch increments `signed_requests_total` (`edgegate_signed_requests_total` in Prometheus format).
+
+### Stream-Lifetime Workload Bulkhead & Graceful-Drain Guards (`INV-20` Hardening)
+In streaming environments (Server-Sent Events / SSE, gRPC bidirectional streams, and chunked HTTP responses), connections frequently remain active for extended durations after response headers are delivered.
+- **Persistent Atomic Active Counters:** Active concurrency counts are maintained as `Arc<AtomicUsize>` instances within `WorkloadAuthenticator`. During live zero-downtime hot reloads via `ArcSwap`, active counter instances for surviving workloads are preserved, preventing counter resets or concurrency quota leaks.
+- **`GuardedResponseBody` Stream Ownership:** Upstream response bodies are wrapped in `GuardedResponseBody`, which retains both the `WorkloadBulkheadGuard` and the server `InFlightGuard`. These guards remain alive across all body chunk streaming and are only released when the body stream reaches clean EOF (`Poll::Ready(None)`) or when the response body is dropped due to client disconnection, cancellation, or error. This guarantees that long-lived streaming connections cannot bypass `max_concurrent_requests` or terminate prematurely during server shutdown draining (`drain_timeout_ms`).
+
+### Trailer-Preserving Response Size Caps & Circuit-Breaker Fault Isolation (`INV-21` Hardening)
+- **Trailer Preservation via `BufferedBodyWithTrailers`:** When `max_response_body_bytes` is configured on a route, EdgeGate enforces the byte ceiling using `BufferedBodyWithTrailers`. This body wrapper captures HTTP/2 trailing headers (such as `grpc-status` and `grpc-message`) and applies route-level `strip_response_headers` to both initial response headers and trailers, ensuring gRPC and HTTP/2 semantics remain intact without leaking stripped metadata.
+- **Circuit-Breaker Fault Isolation:** When an upstream response exceeds `max_response_body_bytes`, EdgeGate returns `502 Bad Gateway` (`{"error":"upstream response exceeded maximum allowed body size"}`) and increments `upstream_errors_total`. However, EdgeGate explicitly bypasses `CircuitBreaker::record_failure` for `http_body_util::LengthLimitError`. Route-level payload limit violations represent an enforced client/route SLA policy, not an upstream transport failure, preventing legitimate route restrictions from falsely tripping shared pool circuit breakers.
+
+### Strict JSON-RPC 2.0 Envelope Validation & Explicit Empty Allowlist (`INV-22` Hardening)
+- **`Option<Vec<String>>` Policy Semantics:** Policy rules represent `allowed_jsonrpc_methods` as `Option<Vec<String>>`. When omitted (`None`), JSON-RPC inspection is disabled. When explicitly set to an empty list (`allowed_jsonrpc_methods = []`, represented as `Some(vec![])`), EdgeGate enforces fail-closed rejection (`403 Forbidden`) on all JSON-RPC methods, providing a reliable zero-permission tool lockdown.
+- **Mandatory `"jsonrpc": "2.0"` Envelope:** Every JSON-RPC request (whether a single object or inside a batch array) must contain `"jsonrpc": "2.0"`. Requests lacking this attribute or referencing legacy versions are rejected fail-closed with `400 Bad Request` or `403 Forbidden`.
+
+### CLI Cleartext Admin Protection & Production Packaging
+- **Insecure HTTP Rejection:** The `edgegate audit` CLI refuses to transmit administrative credentials (`X-EdgeGate-Admin-Token`) over cleartext `http://` to non-loopback hosts unless `--allow-insecure-http` is explicitly specified. Passing `--ca-cert` with an `http://` URL is rejected as invalid.
+- **Deterministic Release Packaging:** EdgeGate builds locked, standalone release binaries packaged with SHA-256 checksums (`SHA256SUMS`) and minimal container images for zero-dependency edge deployments.

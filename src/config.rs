@@ -192,6 +192,26 @@ pub struct RouteConfig {
     /// Optional scoped credential injection binding.
     #[serde(default)]
     pub credential: Option<CredentialBindingConfig>,
+    /// Optional outbound cryptographic request signing binding (`INV-23`).
+    #[serde(default)]
+    pub request_signing: Option<RequestSigningConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RequestSigningConfig {
+    pub credential_ref: String,
+    #[serde(default = "default_signature_header")]
+    pub signature_header: String,
+    #[serde(default = "default_timestamp_header")]
+    pub timestamp_header: String,
+}
+
+fn default_signature_header() -> String {
+    "x-edgegate-signature-256".to_string()
+}
+
+fn default_timestamp_header() -> String {
+    "x-edgegate-timestamp".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,7 +251,7 @@ pub struct PolicyRuleConfig {
     pub blocked_body_substrings: Vec<String>,
     /// Optional JSON-RPC 2.0 / MCP allowed tool-call methods (`Milestone 9`).
     #[serde(default)]
-    pub allowed_jsonrpc_methods: Vec<String>,
+    pub allowed_jsonrpc_methods: Option<Vec<String>>,
     /// Optional per-rule request body size limit in bytes (`Milestone 7`; must be `> 0` if `Some`).
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
@@ -387,6 +407,14 @@ pub struct CompiledRoute {
     pub strip_response_headers: Vec<HeaderName>,
     pub inject_response_headers: Vec<(HeaderName, HeaderValue)>,
     pub credential: Option<CompiledCredentialBinding>,
+    pub request_signing: Option<CompiledRequestSigning>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledRequestSigning {
+    pub credential_ref: String,
+    pub signature_header: HeaderName,
+    pub timestamp_header: HeaderName,
 }
 
 #[derive(Debug, Clone)]
@@ -408,7 +436,7 @@ pub struct CompiledPolicyRule {
     pub required_headers: HashMap<String, String>,
     pub forbidden_query_params: Vec<String>,
     pub blocked_body_substrings: Vec<String>,
-    pub allowed_jsonrpc_methods: Vec<String>,
+    pub allowed_jsonrpc_methods: Option<Vec<String>>,
     pub max_body_bytes: Option<usize>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
@@ -475,6 +503,8 @@ impl CompiledConfig {
             None => None,
         };
 
+        let mut seen_workload_concurrency: HashMap<(String, String), Option<usize>> =
+            HashMap::new();
         let mut unix_listeners = Vec::with_capacity(raw.server.unix_listeners.len());
         let mut seen_uds_paths = HashSet::new();
         for u in raw.server.unix_listeners {
@@ -487,6 +517,17 @@ impl CompiledConfig {
                 return Err(EdgeGateError::Config(
                     "max_concurrent_requests must be > 0".to_string(),
                 ));
+            }
+            let key = (u.org_id.clone(), u.workload_id.clone());
+            if let Some(&existing_limit) = seen_workload_concurrency.get(&key) {
+                if existing_limit != u.max_concurrent_requests {
+                    return Err(EdgeGateError::Config(format!(
+                        "conflicting max_concurrent_requests for workload '{}' in org '{}'",
+                        u.workload_id, u.org_id
+                    )));
+                }
+            } else {
+                seen_workload_concurrency.insert(key, u.max_concurrent_requests);
             }
             if u.path.as_os_str().is_empty() || !seen_uds_paths.insert(u.path.clone()) {
                 return Err(EdgeGateError::Config(format!(
@@ -516,6 +557,17 @@ impl CompiledConfig {
                 return Err(EdgeGateError::Config(
                     "max_concurrent_requests must be > 0".to_string(),
                 ));
+            }
+            let key = (w.org_id.clone(), w.workload_id.clone());
+            if let Some(&existing_limit) = seen_workload_concurrency.get(&key) {
+                if existing_limit != w.max_concurrent_requests {
+                    return Err(EdgeGateError::Config(format!(
+                        "conflicting max_concurrent_requests for workload '{}' in org '{}'",
+                        w.workload_id, w.org_id
+                    )));
+                }
+            } else {
+                seen_workload_concurrency.insert(key, w.max_concurrent_requests);
             }
             let digest = match (w.token, w.token_sha256) {
                 (Some(plain), None) => {
@@ -864,6 +916,46 @@ impl CompiledConfig {
                 }
                 None => None,
             };
+            let request_signing = match r.request_signing {
+                Some(s) => {
+                    if s.credential_ref.trim().is_empty() {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' request_signing credential_ref must be non-empty",
+                            r.id
+                        )));
+                    }
+                    let signature_header = HeaderName::from_bytes(
+                        s.signature_header.trim().as_bytes(),
+                    )
+                    .map_err(|e| {
+                        EdgeGateError::Config(format!(
+                            "route '{}' invalid request_signing signature_header '{}': {e}",
+                            r.id, s.signature_header
+                        ))
+                    })?;
+                    let timestamp_header = HeaderName::from_bytes(
+                        s.timestamp_header.trim().as_bytes(),
+                    )
+                    .map_err(|e| {
+                        EdgeGateError::Config(format!(
+                            "route '{}' invalid request_signing timestamp_header '{}': {e}",
+                            r.id, s.timestamp_header
+                        ))
+                    })?;
+                    if signature_header == timestamp_header {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' request_signing signature_header and timestamp_header must be different",
+                            r.id
+                        )));
+                    }
+                    Some(CompiledRequestSigning {
+                        credential_ref: s.credential_ref,
+                        signature_header,
+                        timestamp_header,
+                    })
+                }
+                None => None,
+            };
 
             routes.push(CompiledRoute {
                 id: r.id,
@@ -877,6 +969,7 @@ impl CompiledConfig {
                 strip_response_headers,
                 inject_response_headers,
                 credential,
+                request_signing,
             });
         }
         routes.sort_by(|a, b| {
@@ -945,17 +1038,23 @@ impl CompiledConfig {
                 }
                 blocked_body_substrings.push(pat);
             }
-            let mut allowed_jsonrpc_methods = Vec::with_capacity(pol.allowed_jsonrpc_methods.len());
-            for m in pol.allowed_jsonrpc_methods {
-                let trimmed = m.trim();
-                if trimmed.is_empty() {
-                    return Err(EdgeGateError::Config(format!(
-                        "policy for route '{}' has empty allowed_jsonrpc_methods entry",
-                        pol.route_id
-                    )));
+            let allowed_jsonrpc_methods = match pol.allowed_jsonrpc_methods {
+                Some(methods) => {
+                    let mut list = Vec::with_capacity(methods.len());
+                    for m in methods {
+                        let trimmed = m.trim();
+                        if trimmed.is_empty() {
+                            return Err(EdgeGateError::Config(format!(
+                                "policy for route '{}' has empty allowed_jsonrpc_methods entry",
+                                pol.route_id
+                            )));
+                        }
+                        list.push(trimmed.to_string());
+                    }
+                    Some(list)
                 }
-                allowed_jsonrpc_methods.push(trimmed.to_string());
-            }
+                None => None,
+            };
             let mut methods = HashSet::with_capacity(pol.methods.len());
             for m in pol.methods {
                 let parsed =
@@ -1127,6 +1226,36 @@ pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Pure, safe RFC 2104 HMAC-SHA256 implementation producing a lowercase hex digest (`INV-23`).
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    let mut k_pad = [0u8; 64];
+    if key.len() > 64 {
+        let digest = Sha256::digest(key);
+        k_pad[..32].copy_from_slice(&digest);
+    } else {
+        k_pad[..key.len()].copy_from_slice(key);
+    }
+
+    let mut k_ipad = [0u8; 64];
+    let mut k_opad = [0u8; 64];
+    for i in 0..64 {
+        k_ipad[i] = k_pad[i] ^ 0x36;
+        k_opad[i] = k_pad[i] ^ 0x5c;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(k_ipad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(k_opad);
+    outer.update(inner_hash);
+    let outer_hash = outer.finalize();
+
+    hex::encode(outer_hash)
+}
+
 fn decode_sha256_hex(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
     if bytes.len() != 32 {
@@ -1247,5 +1376,13 @@ value = "ghp_secret_123"
         let bad = VALID_TOML.replace("127.0.0.1:9001", "http://127.0.0.1:9001");
         let err = CompiledConfig::from_toml_str(&bad).unwrap_err();
         assert!(err.to_string().contains("without scheme"));
+    }
+
+    #[test]
+    fn rfc4231_test_case_2_hmac_sha256() {
+        let key = b"Jefe";
+        let data = b"what do ya want for nothing?";
+        let expected = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        assert_eq!(hmac_sha256_hex(key, data), expected);
     }
 }

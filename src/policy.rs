@@ -11,7 +11,7 @@ pub enum PolicyDecision {
     Allow {
         max_body_bytes: Option<usize>,
         blocked_body_substrings: Vec<String>,
-        allowed_jsonrpc_methods: Vec<String>,
+        allowed_jsonrpc_methods: Option<Vec<String>>,
     },
     Deny {
         reason: String,
@@ -235,7 +235,7 @@ mod tests {
             required_headers: HashMap::new(),
             forbidden_query_params: Vec::new(),
             blocked_body_substrings: Vec::new(),
-            allowed_jsonrpc_methods: Vec::new(),
+            allowed_jsonrpc_methods: None,
             max_body_bytes: None,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -256,7 +256,7 @@ mod tests {
             PolicyDecision::Allow {
                 max_body_bytes: None,
                 blocked_body_substrings: Vec::new(),
-                allowed_jsonrpc_methods: Vec::new(),
+                allowed_jsonrpc_methods: None,
             }
         );
     }
