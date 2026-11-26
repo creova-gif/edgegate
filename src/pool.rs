@@ -237,6 +237,15 @@ impl ConnectionPool {
         lease: BackendLease,
         request: Request<Full<Bytes>>,
     ) -> Result<Response<PooledBody>, EdgeGateError> {
+        self.send_with_timeout(lease, request, None).await
+    }
+
+    pub async fn send_with_timeout(
+        &self,
+        lease: BackendLease,
+        request: Request<Full<Bytes>>,
+        response_timeout_override: Option<Duration>,
+    ) -> Result<Response<PooledBody>, EdgeGateError> {
         let key = (lease.pool_name.clone(), lease.backend.id.clone());
         let slot = self.slots.get(&key).ok_or_else(|| {
             EdgeGateError::BadGateway(format!(
@@ -252,8 +261,12 @@ impl ConnectionPool {
             ))
         })?;
 
+        let resp_timeout = response_timeout_override.unwrap_or(self.response_timeout);
+
         if lease.backend.http2 {
-            return self.send_http2(slot, permit, lease, request).await;
+            return self
+                .send_http2(slot, permit, lease, request, resp_timeout)
+                .await;
         }
 
         let mut sender = match slot.pop_fresh_http1() {
@@ -294,7 +307,7 @@ impl ConnectionPool {
                 })?;
         }
 
-        let response = tokio::time::timeout(self.response_timeout, sender.send_request(request))
+        let response = tokio::time::timeout(resp_timeout, sender.send_request(request))
             .await
             .map_err(|_| EdgeGateError::GatewayTimeout("upstream response timeout".to_string()))?
             .map_err(|e| EdgeGateError::BadGateway(format!("upstream transport error: {e}")))?;
@@ -338,6 +351,7 @@ impl ConnectionPool {
         permit: OwnedSemaphorePermit,
         lease: BackendLease,
         mut request: Request<Full<Bytes>>,
+        resp_timeout: Duration,
     ) -> Result<Response<PooledBody>, EdgeGateError> {
         // HTTP/2 uses `:authority` pseudo-header (derived from URI authority or Host header);
         // remove `Host` header if URI has authority or keep URI path-and-query clean.
@@ -386,7 +400,7 @@ impl ConnectionPool {
                 })?;
         }
 
-        let response = tokio::time::timeout(self.response_timeout, sender.send_request(request))
+        let response = tokio::time::timeout(resp_timeout, sender.send_request(request))
             .await
             .map_err(|_| {
                 EdgeGateError::GatewayTimeout("upstream HTTP/2 response timeout".to_string())
@@ -419,31 +433,59 @@ impl ConnectionPool {
     ) -> bool {
         let key = (pool_name.to_string(), backend.id.clone());
         let tls_connector = self.slots.get(&key).and_then(|s| s.tls_connector.as_ref());
-        let Ok(mut sender) = self
-            .dial_http1_validated(backend, allow_private_ip, tls_connector)
-            .await
-        else {
-            return false;
-        };
 
-        let Ok(req) = Request::builder()
-            .method(Method::GET)
-            .uri(path)
-            .header(HOST, &backend.authority)
-            .header(CONNECTION, "close")
-            .body(Full::new(Bytes::new()))
-        else {
-            return false;
-        };
+        if backend.http2 {
+            let Ok(mut sender) = self
+                .dial_http2_validated(backend, allow_private_ip, tls_connector)
+                .await
+            else {
+                return false;
+            };
 
-        let Ok(Ok(resp)) =
-            tokio::time::timeout(self.connect_timeout, sender.send_request(req)).await
-        else {
-            return false;
-        };
-        let status_ok = resp.status().is_success();
-        let _ = tokio::time::timeout(self.connect_timeout, resp.into_body().collect()).await;
-        status_ok
+            let Ok(req) = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(HOST, &backend.authority)
+                .body(Full::new(Bytes::new()))
+            else {
+                return false;
+            };
+
+            let Ok(Ok(resp)) =
+                tokio::time::timeout(self.connect_timeout, sender.send_request(req)).await
+            else {
+                return false;
+            };
+            let status_ok = resp.status().is_success();
+            let _ = tokio::time::timeout(self.connect_timeout, resp.into_body().collect()).await;
+            status_ok
+        } else {
+            let Ok(mut sender) = self
+                .dial_http1_validated(backend, allow_private_ip, tls_connector)
+                .await
+            else {
+                return false;
+            };
+
+            let Ok(req) = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(HOST, &backend.authority)
+                .header(CONNECTION, "close")
+                .body(Full::new(Bytes::new()))
+            else {
+                return false;
+            };
+
+            let Ok(Ok(resp)) =
+                tokio::time::timeout(self.connect_timeout, sender.send_request(req)).await
+            else {
+                return false;
+            };
+            let status_ok = resp.status().is_success();
+            let _ = tokio::time::timeout(self.connect_timeout, resp.into_body().collect()).await;
+            status_ok
+        }
     }
 
     async fn dial_http1_validated(

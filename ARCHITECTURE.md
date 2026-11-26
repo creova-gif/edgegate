@@ -46,37 +46,41 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     required_headers, forbidden_query_params)` and resolves per-rule       ║
 ║     │     `max_body_bytes` & `blocked_body_substrings` (`403` on violation)      ║
 ║     ▼                                                                            ║
-║  [Step 5] Per-Workload Token-Bucket Rate Limiter (`TokenBucketRateLimiter`)      ║
-║     │     Enforces `rate_limit_rps` & `rate_limit_burst` (`429 Too Many Reqs`)   ║
-║     ▼                                                                            ║
-║  [Step 6] Bounded Body Collection & Egress DLP Payload Guard (`INV-17`, `INV-19`)║
-║     │     • Enforces `min(server.max_request_body_bytes, policy.max_body_bytes)` ║
-║     │       via `http_body_util::Limited` (`413 Payload Too Large` on overflow)  ║
-║     │     • Scans body against `blocked_body_substrings`; rejects exfiltration   ║
-║     │       fail-closed with `403 Forbidden` (`dlp_blocked_total`)               ║
-║     ▼                                                                            ║
+║  [Step 5] Per-Workload Concurrency Bulkheads & Rate Limiter (INV-20)         ║
+║     │     • Enforces per-workload max_concurrent_requests semaphore (429)    ║
+║     │     • Enforces rate_limit_rps & rate_limit_burst (429 Too Many Reqs)   ║
+║     ▼                                                                        ║
+║  [Step 6] Bounded Body, Egress DLP & JSON-RPC Allowlist (INV-17/19/22)        ║
+║     │     • Enforces policy.max_body_bytes.unwrap_or(server.max_request_body_ ║
+║     │       bytes) via http_body_util::Limited (413 on overflow)             ║
+║     │     • Scans body against blocked_body_substrings (403, INV-19)          ║
+║     │     • Enforces allowed_jsonrpc_methods on JSON-RPC 2.0 (403, INV-22)    ║
+║     ▼                                                                        ║
 ║  [Step 7] Weighted Load Balancer & 3-State Circuit Breaker (`PoolLoadBalancer`)  ║
 ║     │     Weighted `RoundRobin` | `LeastConnections` | `ConsistentHash` | `EWMA` ║
 ║     │     Acquires RAII `BackendLease` (`Closed` / `Open` / `HalfOpen` probe)    ║
-║     ▼                                                                            ║
+║     ▼                                                                        ║
 ║  [Step 8] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
 ║     │     Strips hop-by-hop, `X-EdgeGate-Token`, `Proxy-Authorization`, forged   ║
 ║     │     auth headers; verifies secret TTL (`expires_at_epoch_s`, `403` on      ║
 ║     │     expiry) and injects W3C `traceparent` + `(org_id, credential_ref)`     ║
-║     ▼                                                                            ║
+║     ▼                                                                        ║
 ║  [Step 9] Bounded Connection Pool + Outbound mTLS (`INV-18`) + SSRF + Failover   ║
 ║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
 ║     │     • Outbound TLS 1.2/1.3 & optional Mutual TLS (`client_cert_pem` +      ║
 ║     │       `client_key_pem`), HTTP/1.1 `PooledBody` guard or HTTP/2 `h2`        ║
 ║     │     • Controlled failover (`max_idempotent_retries`) for `GET`/`HEAD`/     ║
 ║     │       `OPTIONS` only; never follows `3xx` or retries state-mutating verbs  ║
-║     ▼                                                                            ║
-║  [Step 10] Response Reflection Guard, Header Hardening & Audit Chain (`INV-16`)  ║
-║           • When `block_secret_reflection = true`, inspects upstream response    ║
-║             headers and body; blocks leaked secrets with `502 Bad Gateway`       ║
-║           • Applies route `strip_response_headers` & `inject_response_headers`   ║
-║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->             ║
-║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram    ║
+║     ▼                                                                        ║
+║  [Step 10] Response Reflection Guard, Route SLAs & Audit Chain (INV-16/21/22) ║
+║           • Enforces route timeout_ms SLA (504) & max_response_body_bytes     ║
+║             ceiling (502 Bad Gateway on overflow, INV-21)                    ║
+║           • When `block_secret_reflection = true`, inspects upstream response ║
+║             headers and body; blocks leaked secrets with `502 Bad Gateway`    ║
+║           • Applies route `strip_response_headers` (headers and trailers)     ║
+║             & `inject_response_headers`                                      ║
+║           • Appends SHA-256 hash-chained audit entry (`prev_hash` ->          ║
+║             `entry_hash`, `INV-16`) & records lock-free microsecond histogram ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
                     │ Primary Dispatch                         │ Async Non-Blocking Clone
                     ▼                                          ▼
@@ -355,3 +359,31 @@ Routes (`[[routes]]`) support declarative outbound response header hardening:
 ### Admin Pool & Circuit-Breaker Topology Introspection (`GET /_edgegate/admin/pools`) & CLI `edgegate audit`
 - **`GET /_edgegate/admin/pools`:** Authenticated by constant-time `X-EdgeGate-Admin-Token` verification, returns a live JSON snapshot of every configured backend pool (`name`, `strategy`, `mtls_enabled`) and each backend's runtime state (`id`, `address`, `weight`, `tls`, `http2`, `active_healthy`, `circuit_state` in `{"closed","open","half_open"}`, `active_connections`, and `ewma_latency_us`).
 - **`edgegate audit` CLI Subcommand:** Allows operators to fetch and verify the cryptographic SHA-256 hash-chained audit ledger from `/_edgegate/admin/audit` directly via `edgegate audit --url <URL> --admin-token <TOKEN>`.
+
+---
+
+## 13. Workload Bulkhead Isolation, JSON-RPC 2.0 / MCP Method Allowlists, Route Timeout SLAs & Protocol Hardening (`Milestone 9` / `v0.9.0`)
+
+### Per-Workload Concurrency Quotas & Bulkhead Isolation (`INV-20`, `max_concurrent_requests`)
+In multi-tenant AI agent deployments, autonomous agents frequently execute looping sub-tasks or unconstrained concurrent tool calls. While token-bucket rate limits (`rate_limit_rps` / `rate_limit_burst`) throttle request arrival rates, slow upstream endpoints (such as LLM generation or complex database tools) allow an aggressive or stalled sandbox to accumulate dozens or hundreds of concurrent in-flight connections. This saturates shared upstream connection pool semaphores (`max_connections_per_upstream`), starving well-behaved neighbor workloads.
+- **Bulkhead Semaphore Allocation:** Each workload configured under `[[workloads]]` or `[[server.unix_listeners]]` may specify `max_concurrent_requests: Option<usize>` (must be `> 0`). EdgeGate maintains dedicated in-flight concurrency semaphores keyed per `(org_id, workload_id)` partition.
+- **Fail-Closed Rejection:** If an arriving request exceeds the workload's in-flight concurrency ceiling, EdgeGate rejects it immediately with `429 Too Many Requests`, sets `Retry-After: 1`, returns JSON `{"error":"workload concurrency limit exceeded"}`, increments `bulkhead_rejected_total` (`edgegate_bulkhead_rejected_total` in Prometheus format), and records an audit ledger entry with `decision = "RATE_LIMITED"` / `BULKHEAD_EXCEEDED` and `upstream = "-"`.
+- **RAII Lifecycle Accounting:** Bulkhead permits are held across request body collection, upstream checkout, and streaming response delivery, guaranteeing deterministic reclamation even on client disconnects, timeouts, or upstream aborts.
+
+### Per-Route Request Timeout Overrides & Upstream Response Body Caps (`INV-21`, `timeout_ms`, `max_response_body_bytes`)
+Different upstream services exhibit widely varying latency and payload profiles. EdgeGate provides route-level SLA and resource bound overrides on `[[routes]]`:
+- **Granular Route Timeout Overrides (`timeout_ms`):** Routes can define `timeout_ms: Option<u64>` (validated `> 0`), overriding the global `server.response_timeout_ms` for that specific path. If an upstream fails to return initial response headers within this deadline, EdgeGate aborts the connection with `504 Gateway Timeout`.
+- **Bounded Upstream Response Payloads (`max_response_body_bytes`):** To prevent upstream servers from exhausting gateway memory with unbounded streaming payloads, routes may configure `max_response_body_bytes: Option<usize>`. During response streaming, if the accumulated upstream body bytes exceed this ceiling, EdgeGate immediately terminates the stream, closes the upstream connection to prevent dirty socket reuse, increments `upstream_errors_total`, and fails closed with `502 Bad Gateway` (`{"error":"upstream response exceeded maximum allowed body size"}`).
+
+### JSON-RPC 2.0 / MCP Tool-Call Method Allowlisting (`INV-22`, `allowed_jsonrpc_methods`)
+Modern AI agent systems increasingly interact with tools via JSON-RPC 2.0 and the Model Context Protocol (MCP). Because MCP multiplexes all tool execution, resource reading, and prompt queries over a single HTTP endpoint (e.g., `POST /mcp`), URI-level matching alone cannot distinguish between safe tools (such as `tools/list` or `resources/read`) and dangerous actions (such as `tools/call` for file deletion):
+- **Deep Syntactic AST Inspection:** Policy rules (`[[policies]]`) support `allowed_jsonrpc_methods: Vec<String>`. Before upstream connection checkout or secret injection, EdgeGate parses bounded request payloads using `serde_json::from_slice::<serde_json::Value>`. Malformed JSON is rejected with `400 Bad Request` or `403 Forbidden`.
+- **Single & Batch Request Validation:**
+  - *Single Request:* Verifies `"jsonrpc": "2.0"` and ensures the `"method"` string exists in `allowed_jsonrpc_methods`.
+  - *Batch Array:* If the payload is an array of JSON-RPC objects, every single request in the batch must conform to JSON-RPC 2.0 and have its `"method"` present in the allowlist. If any single item contains an unlisted method, a missing method, or invalid JSON-RPC structure, the entire batch is rejected fail-closed.
+- **Telemetry & Audit:** Blocked calls fail with `403 Forbidden` (`{"error":"forbidden JSON-RPC method: <method>"}`), increment `jsonrpc_blocked_total` (`edgegate_jsonrpc_blocked_total`), record a sanitized flight-recorder entry (`reason = "jsonrpc_method_blocked"`), and append a `BLOCKED` record to the SHA-256 hash-chained audit ledger.
+
+### Protocol & Control-Plane Hardening
+- **Active HTTP/2 Health Probing:** Active background health probes honor `backend.http2 = true`. For HTTP/2 backends, health checks negotiate ALPN `h2` (or `h2c` prior knowledge) and issue HTTP/2 `GET` probes on multiplexed streams, ensuring that backend circuit breakers only remain `Closed` when HTTP/2 framing is verified end-to-end.
+- **HTTP/2 Response Trailer Scrubbing:** EdgeGate applies route `strip_response_headers` to both HTTP/2 initial response headers and trailing headers (trailers), ensuring that backends cannot bypass header stripping by emitting sensitive headers as trailers.
+- **Hardened Operator Audit CLI (`edgegate audit`):** The `edgegate audit` CLI supports the `EDGEGATE_ADMIN_TOKEN` environment variable and `--ca-cert <PATH>` for verified HTTPS administration. The CLI recomputes the SHA-256 hash chain from genesis through all records to the head hash client-side, terminating with an error if cryptographic tampering is detected.

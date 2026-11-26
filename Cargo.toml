@@ -1,6 +1,6 @@
 [package]
 name = "edgegate"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "High-performance programmable L7 reverse proxy and load balancer for zero-secret workload execution"
 
@@ -17,6 +17,7 @@ pin-project-lite = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sha2 = "0.10"
 subtle = "2.6"
 thiserror = "2.0"
@@ -31,3 +32,5 @@ zeroize = { version = "1.8", features = ["derive"] }
 [dev-dependencies]
 rcgen = "0.13"
 tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"

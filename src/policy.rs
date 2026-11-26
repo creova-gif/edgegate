@@ -11,6 +11,7 @@ pub enum PolicyDecision {
     Allow {
         max_body_bytes: Option<usize>,
         blocked_body_substrings: Vec<String>,
+        allowed_jsonrpc_methods: Vec<String>,
     },
     Deny {
         reason: String,
@@ -188,6 +189,7 @@ impl PolicyEngine for DefaultDenyPolicyEngine {
             return PolicyDecision::Allow {
                 max_body_bytes: rule.max_body_bytes,
                 blocked_body_substrings: rule.blocked_body_substrings.clone(),
+                allowed_jsonrpc_methods: rule.allowed_jsonrpc_methods.clone(),
             };
         }
 
@@ -233,6 +235,7 @@ mod tests {
             required_headers: HashMap::new(),
             forbidden_query_params: Vec::new(),
             blocked_body_substrings: Vec::new(),
+            allowed_jsonrpc_methods: Vec::new(),
             max_body_bytes: None,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -246,12 +249,14 @@ mod tests {
             workload_id: "agent-1".to_string(),
             org_id: "org-alpha".to_string(),
             roles: ["repo:read".to_string()].into_iter().collect(),
+            max_concurrent_requests: None,
         };
         assert_eq!(
             engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
             PolicyDecision::Allow {
                 max_body_bytes: None,
                 blocked_body_substrings: Vec::new(),
+                allowed_jsonrpc_methods: Vec::new(),
             }
         );
     }
@@ -263,6 +268,7 @@ mod tests {
             workload_id: "agent-1".to_string(),
             org_id: "org-alpha".to_string(),
             roles: HashSet::new(),
+            max_concurrent_requests: None,
         };
         assert!(matches!(
             engine.evaluate(&id, "github", &Method::GET, "/v1/github/repos/edgegate"),
@@ -277,6 +283,7 @@ mod tests {
             workload_id: "agent-1".to_string(),
             org_id: "org-beta".to_string(),
             roles: ["repo:read".to_string()].into_iter().collect(),
+            max_concurrent_requests: None,
         };
         assert!(matches!(
             engine.evaluate(&other_org, "github", &Method::GET, "/v1/github/repos"),
@@ -287,6 +294,7 @@ mod tests {
             workload_id: "agent-1".to_string(),
             org_id: "org-alpha".to_string(),
             roles: ["repo:read".to_string()].into_iter().collect(),
+            max_concurrent_requests: None,
         };
         assert!(matches!(
             engine.evaluate(&alpha, "github", &Method::GET, "/v1/github/repos-admin"),
