@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderName, Method};
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -37,12 +38,30 @@ pub struct ServerConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_response_timeout_ms")]
     pub response_timeout_ms: u64,
+    /// Graceful shutdown in-flight request drain timeout (`Milestone 5`).
+    #[serde(default = "default_drain_timeout_ms")]
+    pub drain_timeout_ms: u64,
     /// Bounded flight-recorder ring buffer capacity for failed/shadow-mismatched requests (`Milestone 3`).
     #[serde(default = "default_replay_buffer_size")]
     pub replay_buffer_size: usize,
+    /// Optional inbound TLS (`rustls`) listener certificate/key configuration (`Milestone 5`).
+    #[serde(default)]
+    pub tls: Option<ServerTlsConfig>,
     /// Optional zero-token Unix domain socket listeners bound to specific workload identities.
     #[serde(default)]
     pub unix_listeners: Vec<UnixListenerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerTlsConfig {
+    #[serde(default)]
+    pub cert_pem: Option<String>,
+    #[serde(default)]
+    pub key_pem: Option<String>,
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +110,9 @@ pub struct PoolConfig {
     pub health_check_path: Option<String>,
     #[serde(default = "default_health_check_interval_ms")]
     pub health_check_interval_ms: u64,
+    /// Controlled retry count for idempotent (`GET`/`HEAD`/`OPTIONS`) upstream transport errors (`Milestone 5`).
+    #[serde(default)]
+    pub max_idempotent_retries: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -144,6 +166,9 @@ pub struct CredentialBindingConfig {
     /// Optional prefix prepended to secret value (e.g. `"Bearer "`).
     #[serde(default)]
     pub value_prefix: String,
+    /// Inspect upstream response headers/body and block with `502` if the injected secret is reflected (`Milestone 5`).
+    #[serde(default)]
+    pub block_secret_reflection: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,6 +215,10 @@ fn default_response_timeout_ms() -> u64 {
     10_000
 }
 
+fn default_drain_timeout_ms() -> u64 {
+    5_000
+}
+
 fn default_replay_buffer_size() -> usize {
     64
 }
@@ -225,7 +254,9 @@ pub struct CompiledConfig {
     pub max_request_body_bytes: usize,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    pub drain_timeout: Duration,
     pub replay_buffer_size: usize,
+    pub inbound_tls: Option<Arc<RustlsServerConfig>>,
     pub unix_listeners: Vec<CompiledUnixListener>,
     pub workloads: HashMap<[u8; 32], CompiledWorkload>,
     pub pools: HashMap<String, CompiledPool>,
@@ -260,6 +291,7 @@ pub struct CompiledPool {
     pub custom_ca_certs: Vec<CertificateDer<'static>>,
     pub health_check_path: Option<String>,
     pub health_check_interval: Duration,
+    pub max_idempotent_retries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +321,7 @@ pub struct CompiledCredentialBinding {
     pub credential_ref: String,
     pub header_name: HeaderName,
     pub value_prefix: String,
+    pub block_secret_reflection: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -330,11 +363,19 @@ impl CompiledConfig {
                 "server.max_request_body_bytes must be > 0".to_string(),
             ));
         }
-        if raw.server.connect_timeout_ms == 0 || raw.server.response_timeout_ms == 0 {
+        if raw.server.connect_timeout_ms == 0
+            || raw.server.response_timeout_ms == 0
+            || raw.server.drain_timeout_ms == 0
+        {
             return Err(EdgeGateError::Config(
                 "server timeouts must be > 0".to_string(),
             ));
         }
+
+        let inbound_tls = match raw.server.tls {
+            Some(ref tls_cfg) => Some(compile_server_tls(tls_cfg)?),
+            None => None,
+        };
 
         let mut unix_listeners = Vec::with_capacity(raw.server.unix_listeners.len());
         let mut seen_uds_paths = HashSet::new();
@@ -505,6 +546,7 @@ impl CompiledConfig {
                         health_check_interval: Duration::from_millis(
                             p.health_check_interval_ms.max(100),
                         ),
+                        max_idempotent_retries: p.max_idempotent_retries,
                     },
                 )
                 .is_some()
@@ -564,6 +606,7 @@ impl CompiledConfig {
                         credential_ref: c.credential_ref,
                         header_name,
                         value_prefix: c.value_prefix,
+                        block_secret_reflection: c.block_secret_reflection,
                     })
                 }
                 None => None,
@@ -674,7 +717,9 @@ impl CompiledConfig {
             max_request_body_bytes: raw.server.max_request_body_bytes,
             connect_timeout: Duration::from_millis(raw.server.connect_timeout_ms),
             response_timeout: Duration::from_millis(raw.server.response_timeout_ms),
+            drain_timeout: Duration::from_millis(raw.server.drain_timeout_ms),
             replay_buffer_size: raw.server.replay_buffer_size.max(1),
+            inbound_tls,
             unix_listeners,
             workloads,
             pools,
@@ -683,6 +728,70 @@ impl CompiledConfig {
             secrets,
         })
     }
+}
+
+fn compile_server_tls(cfg: &ServerTlsConfig) -> Result<Arc<RustlsServerConfig>, EdgeGateError> {
+    let cert_pem = match (&cfg.cert_pem, &cfg.cert_path) {
+        (Some(pem), None) => pem.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+            EdgeGateError::Config(format!(
+                "failed to read server.tls.cert_path '{}': {e}",
+                path.display()
+            ))
+        })?,
+        (Some(_), Some(_)) => {
+            return Err(EdgeGateError::Config(
+                "server.tls cannot set both cert_pem and cert_path".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(EdgeGateError::Config(
+                "server.tls must set either cert_pem or cert_path".to_string(),
+            ));
+        }
+    };
+
+    let key_pem = match (&cfg.key_pem, &cfg.key_path) {
+        (Some(pem), None) => pem.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+            EdgeGateError::Config(format!(
+                "failed to read server.tls.key_path '{}': {e}",
+                path.display()
+            ))
+        })?,
+        (Some(_), Some(_)) => {
+            return Err(EdgeGateError::Config(
+                "server.tls cannot set both key_pem and key_path".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(EdgeGateError::Config(
+                "server.tls must set either key_pem or key_path".to_string(),
+            ));
+        }
+    };
+
+    let certs = parse_pem_certs(&cert_pem)
+        .map_err(|msg| EdgeGateError::Config(format!("invalid server.tls certificate: {msg}")))?;
+    let key = parse_pem_private_key(&key_pem)
+        .map_err(|msg| EdgeGateError::Config(format!("invalid server.tls private key: {msg}")))?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls_cfg = RustlsServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| EdgeGateError::Config(format!("failed to configure TLS versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| EdgeGateError::Config(format!("invalid server.tls cert/key pair: {e}")))?;
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(tls_cfg))
+}
+
+fn parse_pem_private_key(pem: &str) -> Result<PrivateKeyDer<'static>, String> {
+    let mut reader = Cursor::new(pem.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| format!("failed to parse PEM private key: {e}"))?
+        .ok_or_else(|| "no private key found in PEM".to_string())
 }
 
 pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {

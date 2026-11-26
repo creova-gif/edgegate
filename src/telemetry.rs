@@ -22,7 +22,7 @@ pub struct ReplayRecord {
     pub latency_us: u64,
 }
 
-/// Atomic request, decision, rate-limit, shadow, reload, and flight-recorder telemetry (`Milestone 4`).
+/// Atomic request, decision, rate-limit, shadow, reload, retry, reflection-guard, and flight-recorder telemetry (`Milestone 5`).
 #[derive(Debug)]
 pub struct Telemetry {
     request_seq: AtomicU64,
@@ -35,6 +35,9 @@ pub struct Telemetry {
     config_generation: AtomicU64,
     shadow_requests_total: AtomicU64,
     shadow_mismatches_total: AtomicU64,
+    secret_reflections_blocked_total: AtomicU64,
+    retries_total: AtomicU64,
+    in_flight_requests: AtomicU64,
     replay_capacity: usize,
     replay_ring: Mutex<VecDeque<ReplayRecord>>,
 }
@@ -50,6 +53,9 @@ pub struct TelemetrySnapshot {
     pub config_generation: u64,
     pub shadow_requests_total: u64,
     pub shadow_mismatches_total: u64,
+    pub secret_reflections_blocked_total: u64,
+    pub retries_total: u64,
+    pub in_flight_requests: u64,
 }
 
 impl Default for Telemetry {
@@ -76,6 +82,9 @@ impl Telemetry {
             config_generation: AtomicU64::new(1),
             shadow_requests_total: AtomicU64::new(0),
             shadow_mismatches_total: AtomicU64::new(0),
+            secret_reflections_blocked_total: AtomicU64::new(0),
+            retries_total: AtomicU64::new(0),
+            in_flight_requests: AtomicU64::new(0),
             replay_capacity: cap,
             replay_ring: Mutex::new(VecDeque::with_capacity(cap)),
         }
@@ -83,6 +92,27 @@ impl Telemetry {
 
     pub fn next_request_id(&self) -> u64 {
         self.request_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn inc_in_flight(&self) {
+        self.in_flight_requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn dec_in_flight(&self) {
+        self.in_flight_requests.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn in_flight_count(&self) -> u64 {
+        self.in_flight_requests.load(Ordering::Acquire)
+    }
+
+    pub fn record_retry(&self) {
+        self.retries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_secret_reflection_blocked(&self) {
+        self.secret_reflections_blocked_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reload_success(&self) -> u64 {
@@ -158,13 +188,18 @@ impl Telemetry {
             config_generation: self.config_generation.load(Ordering::Acquire),
             shadow_requests_total: self.shadow_requests_total.load(Ordering::Relaxed),
             shadow_mismatches_total: self.shadow_mismatches_total.load(Ordering::Relaxed),
+            secret_reflections_blocked_total: self
+                .secret_reflections_blocked_total
+                .load(Ordering::Relaxed),
+            retries_total: self.retries_total.load(Ordering::Relaxed),
+            in_flight_requests: self.in_flight_requests.load(Ordering::Acquire),
         }
     }
 
     pub fn to_json(&self) -> String {
         let s = self.snapshot();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -173,11 +208,14 @@ impl Telemetry {
             s.reload_failures_total,
             s.config_generation,
             s.shadow_requests_total,
-            s.shadow_mismatches_total
+            s.shadow_mismatches_total,
+            s.secret_reflections_blocked_total,
+            s.retries_total,
+            s.in_flight_requests
         )
     }
 
-    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and `config_generation` (`Milestone 4`).
+    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and gauges (`Milestone 5`).
     pub fn to_prometheus(&self) -> String {
         let s = self.snapshot();
         format!(
@@ -207,7 +245,16 @@ impl Telemetry {
              edgegate_shadow_requests_total {}\n\
              # HELP edgegate_shadow_mismatches_total Total shadow responses whose status differed from primary.\n\
              # TYPE edgegate_shadow_mismatches_total counter\n\
-             edgegate_shadow_mismatches_total {}\n",
+             edgegate_shadow_mismatches_total {}\n\
+             # HELP edgegate_secret_reflections_blocked_total Total upstream responses blocked due to reflected injected secret.\n\
+             # TYPE edgegate_secret_reflections_blocked_total counter\n\
+             edgegate_secret_reflections_blocked_total {}\n\
+             # HELP edgegate_retries_total Total controlled idempotent upstream failover retries.\n\
+             # TYPE edgegate_retries_total counter\n\
+             edgegate_retries_total {}\n\
+             # HELP edgegate_in_flight_requests Current number of in-flight requests being processed.\n\
+             # TYPE edgegate_in_flight_requests gauge\n\
+             edgegate_in_flight_requests {}\n",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -216,7 +263,10 @@ impl Telemetry {
             s.reload_failures_total,
             s.config_generation,
             s.shadow_requests_total,
-            s.shadow_mismatches_total
+            s.shadow_mismatches_total,
+            s.secret_reflections_blocked_total,
+            s.retries_total,
+            s.in_flight_requests
         )
     }
 

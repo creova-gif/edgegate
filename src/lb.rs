@@ -423,6 +423,7 @@ mod tests {
                 custom_ca_certs: Vec::new(),
                 health_check_path: None,
                 health_check_interval: Duration::from_secs(5),
+                max_idempotent_retries: 0,
             },
         );
         PoolLoadBalancer::from_pools(&pools)

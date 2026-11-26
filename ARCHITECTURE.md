@@ -20,8 +20,8 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 │  • Zero upstream API keys in env, disk, or memory                                │
 │  • Zero default route to the public internet                                     │
 └───────────────────┬──────────────────────────────────────────┬───────────────────┘
-                    │ Zero-Token UDS Socket                    │ TCP + X-EdgeGate-Token
-                    │ (TransportBoundAuthenticator)            │ (SHA-256 ConstantTimeEq)
+                    │ Zero-Token UDS Socket                    │ TCP / Inbound TLS (h2/http1.1)
+                    │ (TransportBoundAuthenticator)            │ + X-EdgeGate-Token (SHA-256)
                     ▼                                          ▼
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                              EdgeGate L7 Data Plane                              ║
@@ -55,10 +55,15 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║  [Step 8] Bounded Body Collection (`http_body_util::Limited`, `413` on overflow) ║
 ║     │                                                                            ║
 ║     ▼                                                                            ║
-║  [Step 9] Bounded Connection Pool + Resolve-Validate-Connect SSRF Defense        ║
-║           • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
-║           • HTTP/1.1 single-flight (`PooledBody` EOF-drain guard) or HTTP/2 `h2` ║
-║           • Never follows `3xx` redirects; never auto-retries failed writes      ║
+║  [Step 9] Bounded Connection Pool + SSRF Defense + Idempotent Failover           ║
+║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
+║     │     • HTTP/1.1 single-flight (`PooledBody` EOF-drain guard) or HTTP/2 `h2` ║
+║     │     • Controlled failover (`max_idempotent_retries`) for `GET`/`HEAD`/     ║
+║     │       `OPTIONS` only; never follows `3xx` or retries state-mutating verbs  ║
+║     ▼                                                                            ║
+║  [Step 10] Defense-in-Depth Response Credential Reflection Guard                 ║
+║           • When `block_secret_reflection = true`, inspects upstream response    ║
+║             headers and body; blocks leaked secrets with `502 Bad Gateway`       ║
 ╚═══════════════════╤══════════════════════════════════════════╤═══════════════════╝
                     │ Primary Dispatch                         │ Async Non-Blocking Clone
                     ▼                                          ▼
@@ -126,11 +131,11 @@ When `backend.http2 = true` is configured on a backend:
 - **Outbound TLS (`tls = true`):** `build_tls_connector` configures `rustls::ClientConfig::alpn_protocols = vec![b"h2", b"http/1.1"]` and negotiates HTTP/2 over TLS 1.2/1.3 using `hyper::client::conn::http2::handshake`.
 - **Outbound Plaintext (`tls = false`):** Dials HTTP/2 prior-knowledge (`h2c`) over the validated TCP stream.
 - **Multiplexed Sender Sharing:** Unlike HTTP/1.1 where a `SendRequest` handle is moved out of the idle queue for the duration of a single request, `UpstreamSlot` stores a cloneable `Option<Http2SendRequest<Full<Bytes>>>`. Concurrent requests clone the ready `Http2SendRequest` handle and multiplex HTTP/2 streams over the single underlying connection while still acquiring an `OwnedSemaphorePermit` from `slot.semaphore` to bound maximum concurrent streams per backend.
-- **Inbound Auto-Detection:** Both TCP and Unix domain socket listeners use `hyper_util::server::conn::auto::Builder` to automatically serve both HTTP/1.1 and HTTP/2 (`h2c`) clients on the same socket.
+- **Inbound Auto-Detection & TLS Termination (`[server.tls]`):** Both TCP and Unix domain socket listeners use `hyper_util::server::conn::auto::Builder` to automatically serve both HTTP/1.1 and HTTP/2 (`h2c`) clients on the same socket. When `[server.tls]` is configured (`cert_pem`/`key_pem` or `cert_path`/`key_path`), EdgeGate wraps the TCP listener in `tokio_rustls::TlsAcceptor` (`rustls::ServerConfig`) advertising `alpn_protocols = vec![b"h2", b"http/1.1"]`, terminating TLS 1.2/1.3 and negotiating HTTP/2 (`h2`) or HTTP/1.1 seamlessly.
 
 ---
 
-## 4. Load Balancing & Three-State Circuit Breakers (`src/lb.rs`)
+## 4. Load Balancing, Three-State Circuit Breakers & Idempotent Failover (`src/lb.rs`, `src/proxy.rs`)
 
 ### Three-State Per-Backend Circuit Breaker (`Closed` -> `Open` -> `HalfOpen`)
 
@@ -160,6 +165,8 @@ Every backend maintains an independent state machine (`CircuitState`) alongside 
    When `Open { until }` expires (`now >= until`), the first arriving request atomically transitions the state to `HalfOpen { probe_in_flight: true }` and receives a `BackendLease` armed with a `half_open_probe` RAII guard. While `probe_in_flight == true`, all other concurrent requests bypass this backend.
    - If the probe request is aborted before reaching the upstream (e.g., outbound header validation or body limit failure), `BackendLease::drop` automatically resets `probe_in_flight: false` so the backend does not livelock.
    - Once dispatched (`lease.settle_probe()`), a `2xx`–`4xx` response calls `record_success`, resetting the circuit to `Closed { consecutive_failures: 0 }`. A `502`/`504`/`5xx` calls `record_failure`, immediately re-opening the circuit (`Open { until: now + cooldown }`).
+3. **Controlled Idempotent Failover Retries (`max_idempotent_retries`):**
+   Pools may configure `max_idempotent_retries` (default `0`). When an upstream attempt fails with a connect or transport error (`EdgeGateError::UpstreamConnect` / `EdgeGateError::UpstreamTimeout`), EdgeGate records the failure on the failed backend and—**only if the HTTP method is safe/idempotent (`GET`, `HEAD`, `OPTIONS`)**—selects the next healthy backend in the pool, increments `retries_total`, and re-dispatches the request. State-mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) are **never** retried to prevent duplicate side effects.
 
 ### Four Load-Balancing Strategies (`LbStrategyConfig`)
 
@@ -233,7 +240,7 @@ Routes configured with `shadow_pool = "<canary-pool>"` clone the sanitized, cred
 - EdgeGate compares the primary and shadow HTTP status codes, incrementing `shadow_requests_total` and `shadow_mismatches_total`.
 
 ### Sanitized Flight-Recorder Replay (`GET /_edgegate/replay`)
-Whenever an authorized request encounters an open circuit breaker (`503`), an upstream transport/timeout failure (`502`/`504`), an upstream `5xx` error, or a shadow status mismatch (`shadow_status_mismatch`), EdgeGate records a `ReplayRecord` in a bounded ring buffer (`replay_buffer_size`, default `64`):
+Whenever an authorized request encounters an open circuit breaker (`503`), an upstream transport/timeout failure (`502`/`504`), an upstream `5xx` error, a blocked secret reflection (`secret_reflection_blocked` -> `502`), or a shadow status mismatch (`shadow_status_mismatch`), EdgeGate records a `ReplayRecord` in a bounded ring buffer (`replay_buffer_size`, default `64`):
 ```json
 {
   "records": [
@@ -254,3 +261,16 @@ Whenever an authorized request encounters an open circuit breaker (`503`), an up
 }
 ```
 By strict design, `ReplayRecord` never stores request headers, response headers, request/response bodies, or secret values—giving operators instant diagnostic visibility with zero secret or PII exposure.
+
+---
+
+## 9. Defense-in-Depth Response Credential Reflection Guard & Graceful Connection Draining (`Milestone 5`)
+
+### Response Credential Reflection Guard (`block_secret_reflection = true`)
+While EdgeGate strips all incoming auth headers and never follows `3xx` redirects, a misconfigured debug endpoint or compromised upstream server could echo the incoming request headers or injected secret back inside its HTTP response headers or response body. When `block_secret_reflection = true` is set on `[routes.credential]`:
+1. EdgeGate tracks the exact raw secret value injected into the outbound request for that route.
+2. Before returning the upstream response to the workload, EdgeGate inspects all response header values and collects the bounded response body to scan for the raw secret bytes.
+3. If the secret appears anywhere in the upstream response headers or body, EdgeGate immediately aborts the response, increments `secret_reflections_blocked_total`, records a sanitized `secret_reflection_blocked` entry in `/_edgegate/replay`, and returns `502 Bad Gateway` (`{"error":"upstream response blocked: credential reflection detected"}`) so the secret never crosses back into the sandbox.
+
+### Graceful In-Flight Connection Draining (`drain_timeout_ms`)
+Every active request increments an atomic `in_flight_requests` gauge via an RAII guard (`InFlightGuard`) that decrements on completion or cancellation. When the server receives a shutdown signal (`serve_until`), EdgeGate stops accepting new connections and waits up to `server.drain_timeout_ms` (default `5000 ms`) for `in_flight_requests` to reach `0` before terminating remaining tasks.

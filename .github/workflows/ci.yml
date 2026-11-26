@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**']
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust-quality-and-tests:
@@ -14,6 +18,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (-D warnings)
@@ -23,6 +29,4 @@ jobs:
       - name: Validate demo config
         run: cargo run -- validate --config edgegate.demo.toml
       - name: Security audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
