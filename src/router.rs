@@ -11,6 +11,9 @@ use crate::EdgeGateError;
 /// W3C Trace Context header propagated upstream (`Milestone 4`).
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 
+/// W3C Trace Context state header propagated upstream (`INV-28`).
+pub const TRACESTATE_HEADER: &str = "tracestate";
+
 /// Response header returning the active 32-hex trace identifier to callers (`Milestone 4`).
 pub const TRACE_ID_RESPONSE_HEADER: &str = "x-edgegate-trace-id";
 
@@ -148,6 +151,8 @@ pub fn sanitize_outbound_headers(
     for (name, value) in incoming {
         let lower = name.as_str();
         if lower == WORKLOAD_TOKEN_HEADER
+            || lower == TRACEPARENT_HEADER
+            || lower == TRACESTATE_HEADER
             || name == PROXY_AUTHORIZATION
             || name == HOST
             || HOP_BY_HOP_HEADERS.contains(&lower)
@@ -220,11 +225,103 @@ fn parse_w3c_traceparent(raw: &str) -> Option<(String, String)> {
     Some((trimmed, trace_id_str))
 }
 
+/// Validates and sanitizes an incoming W3C `tracestate` header per W3C Trace Context Level 1 (`INV-28`).
+/// Returns a sanitized `HeaderValue` if valid, or `None` if absent, oversized (>512 bytes),
+/// contains non-printable characters, has >32 members, or contains malformed key-value pairs.
+pub fn sanitize_w3c_tracestate(incoming: &HeaderMap) -> Option<HeaderValue> {
+    let raw = incoming.get(TRACESTATE_HEADER)?.to_str().ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return None;
+    }
+    if !trimmed.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return None;
+    }
+    let members: Vec<&str> = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if members.is_empty() || members.len() > 32 {
+        return None;
+    }
+    for m in &members {
+        let (key, _val) = m.split_once('=')?;
+        if key.trim().is_empty() {
+            return None;
+        }
+    }
+    HeaderValue::from_str(trimmed).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use http::header::{AUTHORIZATION, CONTENT_LENGTH, TRANSFER_ENCODING};
 
     use super::*;
+
+    #[test]
+    fn test_w3c_tracestate_sanitization() {
+        let mut headers = HeaderMap::new();
+
+        // Absent
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // Valid simple
+        headers.insert(TRACESTATE_HEADER, HeaderValue::from_static("rojo=1"));
+        assert_eq!(
+            sanitize_w3c_tracestate(&headers).unwrap().to_str().unwrap(),
+            "rojo=1"
+        );
+
+        // Valid multi-member
+        headers.insert(
+            TRACESTATE_HEADER,
+            HeaderValue::from_static("congo=t61rcWkgMzE, rojo=1"),
+        );
+        assert_eq!(
+            sanitize_w3c_tracestate(&headers).unwrap().to_str().unwrap(),
+            "congo=t61rcWkgMzE, rojo=1"
+        );
+
+        // Empty or whitespace
+        headers.insert(TRACESTATE_HEADER, HeaderValue::from_static("   "));
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // Oversized (>512 bytes)
+        let oversized = format!("vendor={}", "a".repeat(510));
+        headers.insert(
+            TRACESTATE_HEADER,
+            HeaderValue::from_str(&oversized).unwrap(),
+        );
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // Non-printable character (tab is 0x09 < 0x20)
+        headers.insert(TRACESTATE_HEADER, HeaderValue::from_static("rojo=\t1"));
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // >32 members
+        let many_members = (0..33)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        headers.insert(
+            TRACESTATE_HEADER,
+            HeaderValue::from_str(&many_members).unwrap(),
+        );
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // Member missing '='
+        headers.insert(
+            TRACESTATE_HEADER,
+            HeaderValue::from_static("rojo=1,invalidmember"),
+        );
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+
+        // Empty key before '='
+        headers.insert(TRACESTATE_HEADER, HeaderValue::from_static("=novalue"));
+        assert!(sanitize_w3c_tracestate(&headers).is_none());
+    }
 
     #[test]
     fn rejects_traversal_variants_fail_closed() {
@@ -265,6 +362,14 @@ mod tests {
         );
         incoming.insert("x-custom-hop", HeaderValue::from_static("drop-me"));
         incoming.insert("x-trace-id", HeaderValue::from_static("keep-me"));
+        incoming.insert(
+            TRACEPARENT_HEADER,
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        incoming.insert(
+            TRACESTATE_HEADER,
+            HeaderValue::from_static("rojo=1,congo=2"),
+        );
         incoming.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
         incoming.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
 
@@ -277,6 +382,8 @@ mod tests {
             Some("upstream-a:9001")
         );
         assert!(sanitized.get(WORKLOAD_TOKEN_HEADER).is_none());
+        assert!(sanitized.get(TRACEPARENT_HEADER).is_none());
+        assert!(sanitized.get(TRACESTATE_HEADER).is_none());
         assert!(sanitized.get(PROXY_AUTHORIZATION).is_none());
         assert!(sanitized.get("x-api-key").is_none());
         assert!(sanitized.get(CONNECTION).is_none());

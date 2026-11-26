@@ -50,6 +50,8 @@ pub struct ServerConfig {
     /// Optional pre-hashed SHA-256 admin control-plane token (64 hex chars, `Milestone 7`).
     #[serde(default)]
     pub admin_token_sha256: Option<String>,
+    #[serde(default)]
+    pub protect_observability: bool,
     /// Optional inbound TLS (`rustls`) listener certificate/key configuration (`Milestone 5`).
     #[serde(default)]
     pub tls: Option<ServerTlsConfig>,
@@ -68,6 +70,10 @@ pub struct ServerTlsConfig {
     pub cert_path: Option<PathBuf>,
     #[serde(default)]
     pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub client_ca_cert_pem: Option<String>,
+    #[serde(default)]
+    pub client_ca_cert_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +140,12 @@ pub struct PoolConfig {
     /// Controlled retry count for idempotent (`GET`/`HEAD`/`OPTIONS`) upstream transport errors (`Milestone 5`).
     #[serde(default)]
     pub max_idempotent_retries: u32,
+    #[serde(default = "default_dns_cache_ttl_ms")]
+    pub dns_cache_ttl_ms: u64,
+}
+
+fn default_dns_cache_ttl_ms() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -195,6 +207,74 @@ pub struct RouteConfig {
     /// Optional outbound cryptographic request signing binding (`INV-23`).
     #[serde(default)]
     pub request_signing: Option<RequestSigningConfig>,
+    /// Optional outbound AWS SigV4 request signing configuration (`INV-25`).
+    #[serde(default)]
+    pub aws_sigv4: Option<AwsSigV4Config>,
+    /// Optional route-level CORS preflight & browser interoperability policy (`INV-27`).
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CorsConfig {
+    pub allowed_origins: Vec<String>,
+    #[serde(default = "default_cors_methods")]
+    pub allowed_methods: Vec<String>,
+    #[serde(default = "default_cors_headers")]
+    pub allowed_headers: Vec<String>,
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    #[serde(default = "default_cors_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()]
+}
+
+fn default_cors_headers() -> Vec<String> {
+    vec![
+        "content-type".to_string(),
+        "x-edgegate-token".to_string(),
+        "traceparent".to_string(),
+        "tracestate".to_string(),
+    ]
+}
+
+fn default_cors_max_age_secs() -> u64 {
+    600
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledCorsConfig {
+    pub allowed_origins: HashSet<String>,
+    pub allow_methods_value: HeaderValue,
+    pub allow_headers_value: HeaderValue,
+    pub expose_headers_value: Option<HeaderValue>,
+    pub max_age_value: HeaderValue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AwsSigV4Config {
+    pub access_key_ref: String,
+    pub secret_key_ref: String,
+    pub region: String,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledAwsSigV4 {
+    pub access_key_ref: String,
+    pub secret_key_ref: String,
+    pub region: String,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsSigV4Headers {
+    pub authorization: String,
+    pub amz_date: String,
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,6 +415,7 @@ pub struct CompiledConfig {
     pub drain_timeout: Duration,
     pub replay_buffer_size: usize,
     pub admin_token_digest: Option<[u8; 32]>,
+    pub protect_observability: bool,
     pub inbound_tls: Option<Arc<RustlsServerConfig>>,
     pub unix_listeners: Vec<CompiledUnixListener>,
     pub workloads: HashMap<[u8; 32], CompiledWorkload>,
@@ -380,6 +461,7 @@ pub struct CompiledPool {
     pub health_check_path: Option<String>,
     pub health_check_interval: Duration,
     pub max_idempotent_retries: u32,
+    pub dns_cache_ttl: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +490,8 @@ pub struct CompiledRoute {
     pub inject_response_headers: Vec<(HeaderName, HeaderValue)>,
     pub credential: Option<CompiledCredentialBinding>,
     pub request_signing: Option<CompiledRequestSigning>,
+    pub aws_sigv4: Option<CompiledAwsSigV4>,
+    pub cors: Option<CompiledCorsConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +581,12 @@ impl CompiledConfig {
             }
             (None, None) => None,
         };
+
+        if raw.server.protect_observability && admin_token_digest.is_none() {
+            return Err(EdgeGateError::Config(
+                "server.protect_observability = true requires server.admin_token or server.admin_token_sha256".to_string(),
+            ));
+        }
 
         let inbound_tls = match raw.server.tls {
             Some(ref tls_cfg) => Some(compile_server_tls(tls_cfg)?),
@@ -790,6 +880,7 @@ impl CompiledConfig {
                             p.health_check_interval_ms.max(100),
                         ),
                         max_idempotent_retries: p.max_idempotent_retries,
+                        dns_cache_ttl: Duration::from_millis(p.dns_cache_ttl_ms),
                     },
                 )
                 .is_some()
@@ -957,6 +1048,209 @@ impl CompiledConfig {
                 None => None,
             };
 
+            let aws_sigv4 = match r.aws_sigv4 {
+                Some(s) => {
+                    if s.access_key_ref.trim().is_empty()
+                        || s.secret_key_ref.trim().is_empty()
+                        || s.region.trim().is_empty()
+                        || s.service.trim().is_empty()
+                    {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' aws_sigv4 access_key_ref, secret_key_ref, region, and service must be non-empty",
+                            r.id
+                        )));
+                    }
+                    Some(CompiledAwsSigV4 {
+                        access_key_ref: s.access_key_ref.trim().to_string(),
+                        secret_key_ref: s.secret_key_ref.trim().to_string(),
+                        region: s.region.trim().to_string(),
+                        service: s.service.trim().to_string(),
+                    })
+                }
+                None => None,
+            };
+
+            if let (Some(ref cred), Some(ref signing)) = (&credential, &request_signing) {
+                if cred.header_name == signing.signature_header
+                    || cred.header_name == signing.timestamp_header
+                {
+                    return Err(EdgeGateError::Config(format!(
+                        "route '{}' request_signing header collides with credential header '{}'",
+                        r.id, cred.header_name
+                    )));
+                }
+            }
+
+            if aws_sigv4.is_some() {
+                if let Some(ref cred) = credential {
+                    if cred.header_name == http::header::AUTHORIZATION {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' cannot combine aws_sigv4 with Authorization credential injection",
+                            r.id
+                        )));
+                    }
+                }
+                if let Some(ref signing) = request_signing {
+                    let sig_str = signing.signature_header.as_str().to_ascii_lowercase();
+                    let ts_str = signing.timestamp_header.as_str().to_ascii_lowercase();
+                    if sig_str == "authorization"
+                        || sig_str == "x-amz-date"
+                        || sig_str == "x-amz-content-sha256"
+                        || ts_str == "authorization"
+                        || ts_str == "x-amz-date"
+                        || ts_str == "x-amz-content-sha256"
+                    {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' request_signing collides with aws_sigv4 headers",
+                            r.id
+                        )));
+                    }
+                }
+            }
+
+            let cors = match r.cors {
+                Some(ref c) => {
+                    if c.allowed_origins.is_empty() {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' cors.allowed_origins cannot be empty or wildcard '*'",
+                            r.id
+                        )));
+                    }
+                    let mut allowed_origins = HashSet::with_capacity(c.allowed_origins.len());
+                    for orig in &c.allowed_origins {
+                        let trimmed = orig.trim();
+                        if trimmed.is_empty() || trimmed == "*" {
+                            return Err(EdgeGateError::Config(format!(
+                                "route '{}' cors.allowed_origins cannot be empty or wildcard '*'",
+                                r.id
+                            )));
+                        }
+                        if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                            return Err(EdgeGateError::Config(format!(
+                                "route '{}' cors origin '{orig}' must start with http:// or https://",
+                                r.id
+                            )));
+                        }
+                        let normalized = trimmed.trim_end_matches('/').to_ascii_lowercase();
+                        allowed_origins.insert(normalized);
+                    }
+
+                    let mut validated_methods = Vec::with_capacity(c.allowed_methods.len());
+                    for m in &c.allowed_methods {
+                        let trimmed = m.trim();
+                        if trimmed.is_empty() {
+                            return Err(EdgeGateError::Config(format!(
+                                "route '{}' cors.allowed_methods contains empty method",
+                                r.id
+                            )));
+                        }
+                        let method = Method::from_bytes(trimmed.as_bytes()).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors method '{trimmed}': {e}",
+                                r.id
+                            ))
+                        })?;
+                        let upper = method.as_str().to_ascii_uppercase();
+                        if !validated_methods.contains(&upper) {
+                            validated_methods.push(upper);
+                        }
+                    }
+                    if validated_methods.is_empty() {
+                        return Err(EdgeGateError::Config(format!(
+                            "route '{}' cors.allowed_methods cannot be empty",
+                            r.id
+                        )));
+                    }
+                    let allow_methods_str = validated_methods.join(", ");
+                    let allow_methods_value =
+                        HeaderValue::from_str(&allow_methods_str).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors allow_methods HeaderValue: {e}",
+                                r.id
+                            ))
+                        })?;
+
+                    let mut validated_headers = Vec::with_capacity(c.allowed_headers.len());
+                    for h in &c.allowed_headers {
+                        let trimmed = h.trim();
+                        if trimmed.is_empty() {
+                            return Err(EdgeGateError::Config(format!(
+                                "route '{}' cors.allowed_headers contains empty header",
+                                r.id
+                            )));
+                        }
+                        let hdr = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors allowed_header '{trimmed}': {e}",
+                                r.id
+                            ))
+                        })?;
+                        let lower = hdr.as_str().to_ascii_lowercase();
+                        if !validated_headers.contains(&lower) {
+                            validated_headers.push(lower);
+                        }
+                    }
+                    let allow_headers_str = validated_headers.join(", ");
+                    let allow_headers_value =
+                        HeaderValue::from_str(&allow_headers_str).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors allow_headers HeaderValue: {e}",
+                                r.id
+                            ))
+                        })?;
+
+                    let mut validated_expose = Vec::with_capacity(c.expose_headers.len());
+                    for h in &c.expose_headers {
+                        let trimmed = h.trim();
+                        if trimmed.is_empty() {
+                            return Err(EdgeGateError::Config(format!(
+                                "route '{}' cors.expose_headers contains empty header",
+                                r.id
+                            )));
+                        }
+                        let hdr = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors expose_header '{trimmed}': {e}",
+                                r.id
+                            ))
+                        })?;
+                        let lower = hdr.as_str().to_ascii_lowercase();
+                        if !validated_expose.contains(&lower) {
+                            validated_expose.push(lower);
+                        }
+                    }
+                    let expose_headers_value = if validated_expose.is_empty() {
+                        None
+                    } else {
+                        let expose_str = validated_expose.join(", ");
+                        let val = HeaderValue::from_str(&expose_str).map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors expose_headers HeaderValue: {e}",
+                                r.id
+                            ))
+                        })?;
+                        Some(val)
+                    };
+
+                    let max_age_value = HeaderValue::from_str(&c.max_age_secs.to_string())
+                        .map_err(|e| {
+                            EdgeGateError::Config(format!(
+                                "route '{}' invalid cors max_age HeaderValue: {e}",
+                                r.id
+                            ))
+                        })?;
+
+                    Some(CompiledCorsConfig {
+                        allowed_origins,
+                        allow_methods_value,
+                        allow_headers_value,
+                        expose_headers_value,
+                        max_age_value,
+                    })
+                }
+                None => None,
+            };
+
             routes.push(CompiledRoute {
                 id: r.id,
                 path_prefix: r.path_prefix,
@@ -970,6 +1264,8 @@ impl CompiledConfig {
                 inject_response_headers,
                 credential,
                 request_signing,
+                aws_sigv4,
+                cors,
             });
         }
         routes.sort_by(|a, b| {
@@ -1142,6 +1438,7 @@ impl CompiledConfig {
             drain_timeout: Duration::from_millis(raw.server.drain_timeout_ms),
             replay_buffer_size: raw.server.replay_buffer_size.max(1),
             admin_token_digest,
+            protect_observability: raw.server.protect_observability,
             inbound_tls,
             unix_listeners,
             workloads,
@@ -1194,18 +1491,61 @@ fn compile_server_tls(cfg: &ServerTlsConfig) -> Result<Arc<RustlsServerConfig>, 
         }
     };
 
+    let client_ca_pem = match (&cfg.client_ca_cert_pem, &cfg.client_ca_cert_path) {
+        (Some(pem), None) => Some(pem.clone()),
+        (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|e| {
+            EdgeGateError::Config(format!(
+                "failed to read server.tls.client_ca_cert_path '{}': {e}",
+                path.display()
+            ))
+        })?),
+        (Some(_), Some(_)) => {
+            return Err(EdgeGateError::Config(
+                "server.tls cannot set both client_ca_cert_pem and client_ca_cert_path".to_string(),
+            ));
+        }
+        (None, None) => None,
+    };
+
     let certs = parse_pem_certs(&cert_pem)
         .map_err(|msg| EdgeGateError::Config(format!("invalid server.tls certificate: {msg}")))?;
     let key = parse_pem_private_key(&key_pem)
         .map_err(|msg| EdgeGateError::Config(format!("invalid server.tls private key: {msg}")))?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_cfg = RustlsServerConfig::builder_with_provider(provider)
+    let builder = RustlsServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| EdgeGateError::Config(format!("failed to configure TLS versions: {e}")))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| EdgeGateError::Config(format!("invalid server.tls cert/key pair: {e}")))?;
+        .map_err(|e| EdgeGateError::Config(format!("failed to configure TLS versions: {e}")))?;
+
+    let mut tls_cfg = if let Some(ref ca_pem) = client_ca_pem {
+        let ca_certs = parse_pem_certs(ca_pem).map_err(|msg| {
+            EdgeGateError::Config(format!("invalid server.tls client CA certificate: {msg}"))
+        })?;
+        let mut client_roots = rustls::RootCertStore::empty();
+        for ca_cert in ca_certs {
+            client_roots.add(ca_cert).map_err(|e| {
+                EdgeGateError::Config(format!("invalid server.tls client root CA: {e}"))
+            })?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(client_roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|e| {
+            EdgeGateError::Config(format!("invalid server.tls client CA verifier: {e}"))
+        })?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| EdgeGateError::Config(format!("invalid server.tls cert/key pair: {e}")))?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| EdgeGateError::Config(format!("invalid server.tls cert/key pair: {e}")))?
+    };
+
     tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(tls_cfg))
 }
@@ -1226,8 +1566,8 @@ pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Pure, safe RFC 2104 HMAC-SHA256 implementation producing a lowercase hex digest (`INV-23`).
-pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+/// Pure, safe RFC 2104 HMAC-SHA256 implementation producing raw 32 bytes (`INV-25`).
+pub fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut k_pad = [0u8; 64];
     if key.len() > 64 {
         let digest = Sha256::digest(key);
@@ -1253,7 +1593,125 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     outer.update(inner_hash);
     let outer_hash = outer.finalize();
 
-    hex::encode(outer_hash)
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer_hash);
+    out
+}
+
+/// Pure, safe RFC 2104 HMAC-SHA256 implementation producing a lowercase hex digest (`INV-23`).
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    hex::encode(hmac_sha256_bytes(key, message))
+}
+
+/// Pure, safe conversion from UNIX epoch seconds to ISO 8601 AWS timestamps `(amz_date, date_stamp)` (`INV-25`).
+/// Uses Howard Hinnant's civil-from-days algorithm using pure safe integer math.
+pub fn format_amz_timestamps(epoch_secs: u64) -> (String, String) {
+    let secs_of_day = (epoch_secs % 86400) as u32;
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+
+    let z = (epoch_secs / 86400) as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let date_stamp = format!("{y:04}{m:02}{d:02}");
+    let amz_date = format!("{date_stamp}T{hour:02}{minute:02}{second:02}Z");
+    (amz_date, date_stamp)
+}
+
+/// Pure-Rust AWS Signature Version 4 calculation (`AWS4-HMAC-SHA256`, `INV-25`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_aws_sigv4_headers(
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    service: &str,
+    method: &str,
+    canonical_uri: &str,
+    canonical_query: Option<&str>,
+    host: &str,
+    payload: &[u8],
+    amz_date: &str,
+    date_stamp: &str,
+) -> AwsSigV4Headers {
+    let content_sha256 = hex::encode(sha256_digest(payload));
+    let uri = if canonical_uri.is_empty() {
+        "/"
+    } else {
+        canonical_uri
+    };
+
+    let sorted_query = match canonical_query {
+        Some(q) if !q.is_empty() => {
+            let mut pairs: Vec<(&str, &str)> = q
+                .split('&')
+                .filter(|s| !s.is_empty())
+                .map(|pair| {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        (k, v)
+                    } else {
+                        (pair, "")
+                    }
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        }
+        _ => String::new(),
+    };
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host.trim(),
+        content_sha256,
+        amz_date
+    );
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method.to_ascii_uppercase(),
+        uri,
+        sorted_query,
+        canonical_headers,
+        signed_headers,
+        content_sha256
+    );
+    let credential_scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        hex::encode(sha256_digest(canonical_request.as_bytes()))
+    );
+
+    let k_date = hmac_sha256_bytes(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256_bytes(&k_date, region.as_bytes());
+    let k_service = hmac_sha256_bytes(&k_region, service.as_bytes());
+    let k_signing = hmac_sha256_bytes(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256_bytes(&k_signing, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    AwsSigV4Headers {
+        authorization,
+        amz_date: amz_date.to_string(),
+        content_sha256,
+    }
 }
 
 fn decode_sha256_hex(hex_str: &str) -> Result<[u8; 32], String> {
@@ -1384,5 +1842,180 @@ value = "ghp_secret_123"
         let data = b"what do ya want for nothing?";
         let expected = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
         assert_eq!(hmac_sha256_hex(key, data), expected);
+    }
+
+    #[test]
+    fn test_format_amz_timestamps_epoch_zero() {
+        let (amz_date, date_stamp) = format_amz_timestamps(0);
+        assert_eq!(amz_date, "19700101T000000Z");
+        assert_eq!(date_stamp, "19700101");
+    }
+
+    #[test]
+    fn test_format_amz_timestamps_future_epoch() {
+        let (amz_date, date_stamp) = format_amz_timestamps(1755216000);
+        assert_eq!(amz_date, "20250815T000000Z");
+        assert_eq!(date_stamp, "20250815");
+    }
+
+    #[test]
+    fn test_compute_aws_sigv4_headers_deterministic() {
+        let h1 = compute_aws_sigv4_headers(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "s3",
+            "GET",
+            "/test.txt",
+            Some("b=2&a=1"),
+            "examplebucket.s3.amazonaws.com",
+            b"test payload",
+            "20130524T000000Z",
+            "20130524",
+        );
+        let h2 = compute_aws_sigv4_headers(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "s3",
+            "GET",
+            "/test.txt",
+            Some("b=2&a=1"),
+            "examplebucket.s3.amazonaws.com",
+            b"test payload",
+            "20130524T000000Z",
+            "20130524",
+        );
+        assert_eq!(h1, h2);
+        assert_eq!(h1.amz_date, "20130524T000000Z");
+        assert!(h1.authorization.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
+        ));
+        assert!(h1
+            .authorization
+            .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn test_header_collision_credential_vs_request_signing() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.request_signing]
+credential_ref = "github_pat"
+signature_header = "Authorization"
+timestamp_header = "X-Timestamp"
+"#;
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("collides with credential header"));
+    }
+
+    #[test]
+    fn test_header_collision_aws_sigv4_vs_authorization_credential() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.aws_sigv4]
+access_key_ref = "ak"
+secret_key_ref = "sk"
+region = "us-east-1"
+service = "s3"
+"#;
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot combine aws_sigv4 with Authorization credential injection"));
+    }
+
+    #[test]
+    fn test_header_collision_aws_sigv4_vs_request_signing_forbidden_header() {
+        let base = VALID_TOML.replace(
+            "[routes.credential]\ncredential_ref = \"github_pat\"\nheader_name = \"Authorization\"\nvalue_prefix = \"Bearer \"",
+            "[routes.aws_sigv4]\naccess_key_ref = \"ak\"\nsecret_key_ref = \"sk\"\nregion = \"us-east-1\"\nservice = \"s3\"\n[routes.request_signing]\ncredential_ref = \"github_pat\"\nsignature_header = \"x-amz-date\"\ntimestamp_header = \"X-Custom-Time\"",
+        );
+        let err = CompiledConfig::from_toml_str(&base).unwrap_err();
+        assert!(err.to_string().contains("collides with aws_sigv4 headers"));
+    }
+
+    #[test]
+    fn test_protect_observability_requires_admin_token() {
+        let toml = VALID_TOML.replace(
+            "[server]\nlisten_addr = \"127.0.0.1:8080\"",
+            "[server]\nlisten_addr = \"127.0.0.1:8080\"\nprotect_observability = true",
+        );
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("server.protect_observability = true requires server.admin_token or server.admin_token_sha256"));
+
+        let toml_with_admin = toml.replace(
+            "protect_observability = true",
+            "protect_observability = true\nadmin_token = \"super_secret_admin_token\"",
+        );
+        assert!(CompiledConfig::from_toml_str(&toml_with_admin).is_ok());
+    }
+
+    #[test]
+    fn test_cors_config_compilation_success() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.cors]
+allowed_origins = ["https://app.example.com", "http://localhost:3000/"]
+expose_headers = ["x-custom-response", "x-request-id"]
+max_age_secs = 3600
+"#;
+        let compiled = CompiledConfig::from_toml_str(&toml).unwrap();
+        let route = &compiled.routes[0];
+        let cors = route.cors.as_ref().unwrap();
+        assert!(cors.allowed_origins.contains("https://app.example.com"));
+        assert!(cors.allowed_origins.contains("http://localhost:3000"));
+        assert_eq!(
+            cors.allow_methods_value.to_str().unwrap(),
+            "GET, POST, OPTIONS"
+        );
+        assert_eq!(
+            cors.allow_headers_value.to_str().unwrap(),
+            "content-type, x-edgegate-token, traceparent, tracestate"
+        );
+        assert_eq!(
+            cors.expose_headers_value
+                .as_ref()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "x-custom-response, x-request-id"
+        );
+        assert_eq!(cors.max_age_value.to_str().unwrap(), "3600");
+    }
+
+    #[test]
+    fn test_cors_config_wildcard_origin_rejected() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.cors]
+allowed_origins = ["*"]
+"#;
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty or wildcard '*'"));
+    }
+
+    #[test]
+    fn test_cors_config_empty_origins_rejected() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.cors]
+allowed_origins = []
+"#;
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty or wildcard '*'"));
+    }
+
+    #[test]
+    fn test_cors_config_invalid_scheme_rejected() {
+        let toml = VALID_TOML.to_string()
+            + r#"
+[routes.cors]
+allowed_origins = ["ftp://bad.example.com"]
+"#;
+        let err = CompiledConfig::from_toml_str(&toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must start with http:// or https://"));
     }
 }

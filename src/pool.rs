@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST};
 use http::{Method, Request, Response};
@@ -17,6 +18,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use pin_project_lite::pin_project;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
@@ -31,12 +33,42 @@ struct IdleHttp1Conn {
     returned_at: Instant,
 }
 
+pub type DnsCache = Arc<ArcSwap<HashMap<(String, u16, bool), (Vec<SocketAddr>, Instant)>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamSlotConfigKey {
+    pub authority: String,
+    pub max_conns: usize,
+    pub idle_ttl: Duration,
+    pub tls: bool,
+    pub tls_sni: String,
+    pub http2: bool,
+    pub custom_ca_certs_count: usize,
+    pub has_mtls: bool,
+    pub client_key_pem: Option<String>,
+    pub ca_fingerprint: [u8; 32],
+    pub client_cert_fingerprint: [u8; 32],
+}
+
+fn compute_cert_fingerprint(certs: &[CertificateDer<'static>]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for cert in certs {
+        hasher.update(cert.as_ref());
+    }
+    let res = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&res);
+    out
+}
+
 #[derive(Clone)]
 struct UpstreamSlot {
     semaphore: Arc<Semaphore>,
     idle_http1: Arc<Mutex<VecDeque<IdleHttp1Conn>>>,
     h2_sender: Arc<Mutex<Option<Http2SendRequest<Full<Bytes>>>>>,
     idle_ttl: Duration,
+    dns_cache_ttl: Duration,
+    slot_fingerprint: UpstreamSlotConfigKey,
     tls_connector: Option<TlsConnector>,
 }
 
@@ -44,18 +76,27 @@ impl std::fmt::Debug for UpstreamSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamSlot")
             .field("idle_ttl", &self.idle_ttl)
+            .field("dns_cache_ttl", &self.dns_cache_ttl)
             .field("tls_enabled", &self.tls_connector.is_some())
             .finish()
     }
 }
 
 impl UpstreamSlot {
-    fn new(max_conns: usize, idle_ttl: Duration, tls_connector: Option<TlsConnector>) -> Self {
+    fn new(
+        max_conns: usize,
+        idle_ttl: Duration,
+        dns_cache_ttl: Duration,
+        slot_fingerprint: UpstreamSlotConfigKey,
+        tls_connector: Option<TlsConnector>,
+    ) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_conns)),
             idle_http1: Arc::new(Mutex::new(VecDeque::new())),
             h2_sender: Arc::new(Mutex::new(None)),
             idle_ttl,
+            dns_cache_ttl,
+            slot_fingerprint,
             tls_connector,
         }
     }
@@ -123,7 +164,7 @@ impl PooledBody {
     fn try_return_clean(&mut self) {
         if let Some(mut state) = self.state.take() {
             if let Some(sender) = state.http1_sender.take() {
-                if !state.connection_close && !sender.is_closed() && sender.is_ready() {
+                if !state.connection_close && !sender.is_closed() {
                     let mut guard = match state.idle_queue.lock() {
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
@@ -150,13 +191,13 @@ impl Body for PooledBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.project();
-        match this.inner.poll_frame(cx) {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
                 if let Some(mut state) = this.state.take() {
                     if let Some(sender) = state.http1_sender.take() {
-                        if !state.connection_close && !sender.is_closed() && sender.is_ready() {
+                        if !state.connection_close && !sender.is_closed() {
                             let mut guard = match state.idle_queue.lock() {
                                 Ok(g) => g,
                                 Err(poisoned) => poisoned.into_inner(),
@@ -170,7 +211,25 @@ impl Body for PooledBody {
                 }
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(frame))) => {
+                if this.inner.is_end_stream() {
+                    if let Some(mut state) = this.state.take() {
+                        if let Some(sender) = state.http1_sender.take() {
+                            if !state.connection_close && !sender.is_closed() {
+                                let mut guard = match state.idle_queue.lock() {
+                                    Ok(g) => g,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.push_back(IdleHttp1Conn {
+                                    sender,
+                                    returned_at: Instant::now(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(Some(Err(err))) => {
                 *this.state = None;
                 Poll::Ready(Some(Err(err)))
@@ -189,9 +248,10 @@ impl Body for PooledBody {
 
 /// Bounded per-upstream HTTP/1.1 & HTTP/2 connection pool with resolve-validate-connect SSRF protection
 /// and optional `rustls` outbound TLS (with ALPN `h2` when `backend.http2 == true`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConnectionPool {
     slots: HashMap<(String, String), UpstreamSlot>,
+    dns_cache: DnsCache,
     connect_timeout: Duration,
     response_timeout: Duration,
 }
@@ -202,9 +262,51 @@ impl ConnectionPool {
         connect_timeout: Duration,
         response_timeout: Duration,
     ) -> Self {
+        Self::from_pools_reusing(compiled, connect_timeout, response_timeout, None)
+    }
+
+    pub fn from_pools_reusing(
+        compiled: &HashMap<String, CompiledPool>,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+        previous: Option<&ConnectionPool>,
+    ) -> Self {
+        let dns_cache = match previous {
+            Some(prev) => Arc::clone(&prev.dns_cache),
+            None => Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        };
+
         let mut slots = HashMap::new();
         for (pool_name, pool) in compiled {
+            let ca_fingerprint = compute_cert_fingerprint(&pool.custom_ca_certs);
+            let client_cert_fingerprint = compute_cert_fingerprint(&pool.client_cert_chain);
+            let has_mtls = !pool.client_cert_chain.is_empty() && pool.client_key_pem.is_some();
+
             for backend in &pool.backends {
+                let slot_key = (pool_name.clone(), backend.id.clone());
+                let config_key = UpstreamSlotConfigKey {
+                    authority: backend.authority.clone(),
+                    max_conns: pool.max_connections_per_upstream,
+                    idle_ttl: pool.idle_ttl,
+                    tls: backend.tls,
+                    tls_sni: backend.tls_sni.clone(),
+                    http2: backend.http2,
+                    custom_ca_certs_count: pool.custom_ca_certs.len(),
+                    has_mtls,
+                    client_key_pem: pool.client_key_pem.clone(),
+                    ca_fingerprint,
+                    client_cert_fingerprint,
+                };
+
+                if let Some(prev_slot) = previous.and_then(|p| p.slots.get(&slot_key)) {
+                    if prev_slot.slot_fingerprint == config_key {
+                        let mut reused = prev_slot.clone();
+                        reused.dns_cache_ttl = pool.dns_cache_ttl;
+                        slots.insert(slot_key, reused);
+                        continue;
+                    }
+                }
+
                 let tls_connector = if backend.tls {
                     build_tls_connector(
                         &pool.custom_ca_certs,
@@ -215,21 +317,30 @@ impl ConnectionPool {
                 } else {
                     None
                 };
+
                 slots.insert(
-                    (pool_name.clone(), backend.id.clone()),
+                    slot_key,
                     UpstreamSlot::new(
                         pool.max_connections_per_upstream,
                         pool.idle_ttl,
+                        pool.dns_cache_ttl,
+                        config_key,
                         tls_connector,
                     ),
                 );
             }
         }
+
         Self {
             slots,
+            dns_cache,
             connect_timeout,
             response_timeout,
         }
+    }
+
+    pub fn dns_cache(&self) -> &DnsCache {
+        &self.dns_cache
     }
 
     pub async fn send(
@@ -276,6 +387,7 @@ impl ConnectionPool {
                     &lease.backend,
                     lease.allow_private_ip,
                     slot.tls_connector.as_ref(),
+                    slot.dns_cache_ttl,
                 )
                 .await?
             }
@@ -293,6 +405,7 @@ impl ConnectionPool {
                     &lease.backend,
                     lease.allow_private_ip,
                     slot.tls_connector.as_ref(),
+                    slot.dns_cache_ttl,
                 )
                 .await?;
             tokio::time::timeout(self.connect_timeout, sender.ready())
@@ -365,6 +478,7 @@ impl ConnectionPool {
                         &lease.backend,
                         lease.allow_private_ip,
                         slot.tls_connector.as_ref(),
+                        slot.dns_cache_ttl,
                     )
                     .await?;
                 slot.store_h2(dialed.clone());
@@ -384,6 +498,7 @@ impl ConnectionPool {
                     &lease.backend,
                     lease.allow_private_ip,
                     slot.tls_connector.as_ref(),
+                    slot.dns_cache_ttl,
                 )
                 .await?;
             slot.store_h2(dialed.clone());
@@ -432,11 +547,13 @@ impl ConnectionPool {
         path: &str,
     ) -> bool {
         let key = (pool_name.to_string(), backend.id.clone());
-        let tls_connector = self.slots.get(&key).and_then(|s| s.tls_connector.as_ref());
+        let slot = self.slots.get(&key);
+        let tls_connector = slot.and_then(|s| s.tls_connector.as_ref());
+        let dns_cache_ttl = slot.map(|s| s.dns_cache_ttl).unwrap_or(Duration::ZERO);
 
         if backend.http2 {
             let Ok(mut sender) = self
-                .dial_http2_validated(backend, allow_private_ip, tls_connector)
+                .dial_http2_validated(backend, allow_private_ip, tls_connector, dns_cache_ttl)
                 .await
             else {
                 return false;
@@ -461,7 +578,7 @@ impl ConnectionPool {
             status_ok
         } else {
             let Ok(mut sender) = self
-                .dial_http1_validated(backend, allow_private_ip, tls_connector)
+                .dial_http1_validated(backend, allow_private_ip, tls_connector, dns_cache_ttl)
                 .await
             else {
                 return false;
@@ -488,14 +605,53 @@ impl ConnectionPool {
         }
     }
 
+    async fn resolve_cached_or_lookup(
+        &self,
+        backend: &CompiledBackend,
+        allow_private_ip: bool,
+        dns_cache_ttl: Duration,
+    ) -> Result<Vec<SocketAddr>, EdgeGateError> {
+        if dns_cache_ttl == Duration::ZERO {
+            return resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await;
+        }
+
+        let key = (backend.host.clone(), backend.port, allow_private_ip);
+        {
+            let snap = self.dns_cache.load();
+            if let Some((addrs, expires_at)) = snap.get(&key) {
+                if Instant::now() < *expires_at {
+                    return Ok(addrs.clone());
+                }
+            }
+        }
+
+        let resolved =
+            resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
+        let expires_at = Instant::now() + dns_cache_ttl;
+        let resolved_clone = resolved.clone();
+        self.dns_cache.rcu(move |current| {
+            let mut next = (**current).clone();
+            if next.len() > 256 {
+                let now = Instant::now();
+                next.retain(|_, (_, exp)| *exp > now);
+            }
+            next.insert(key.clone(), (resolved_clone.clone(), expires_at));
+            next
+        });
+
+        Ok(resolved)
+    }
+
     async fn dial_http1_validated(
         &self,
         backend: &CompiledBackend,
         allow_private_ip: bool,
         tls_connector: Option<&TlsConnector>,
+        dns_cache_ttl: Duration,
     ) -> Result<Http1SendRequest<Full<Bytes>>, EdgeGateError> {
-        let validated_addrs =
-            resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
+        let validated_addrs = self
+            .resolve_cached_or_lookup(backend, allow_private_ip, dns_cache_ttl)
+            .await?;
         let stream = tokio::time::timeout(
             self.connect_timeout,
             TcpStream::connect(&validated_addrs[..]),
@@ -552,9 +708,11 @@ impl ConnectionPool {
         backend: &CompiledBackend,
         allow_private_ip: bool,
         tls_connector: Option<&TlsConnector>,
+        dns_cache_ttl: Duration,
     ) -> Result<Http2SendRequest<Full<Bytes>>, EdgeGateError> {
-        let validated_addrs =
-            resolve_and_validate_addrs(&backend.host, backend.port, allow_private_ip).await?;
+        let validated_addrs = self
+            .resolve_cached_or_lookup(backend, allow_private_ip, dns_cache_ttl)
+            .await?;
         let stream = tokio::time::timeout(
             self.connect_timeout,
             TcpStream::connect(&validated_addrs[..]),
@@ -750,5 +908,154 @@ mod tests {
             let ip: IpAddr = s.parse().unwrap_or_else(|e| panic!("parse {s}: {e}"));
             assert!(!is_blocked_ip(ip), "expected SSRF guard to allow {s}");
         }
+    }
+
+    #[test]
+    fn reuses_matching_slots_and_dns_cache_across_reloads() {
+        use crate::config::LbStrategyConfig;
+
+        let mut pools = HashMap::new();
+        pools.insert(
+            "p1".to_string(),
+            CompiledPool {
+                name: "p1".to_string(),
+                strategy: LbStrategyConfig::RoundRobin,
+                backends: vec![CompiledBackend {
+                    id: "b1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 8080,
+                    authority: "127.0.0.1:8080".to_string(),
+                    weight: 1,
+                    tls: false,
+                    tls_sni: "127.0.0.1".to_string(),
+                    http2: false,
+                }],
+                max_connections_per_upstream: 16,
+                idle_ttl: Duration::from_secs(30),
+                passive_failure_threshold: 3,
+                passive_cooldown: Duration::from_secs(5),
+                allow_private_ip: true,
+                custom_ca_certs: Vec::new(),
+                client_cert_chain: Vec::new(),
+                client_key_pem: None,
+                health_check_path: None,
+                health_check_interval: Duration::from_secs(5),
+                max_idempotent_retries: 0,
+                dns_cache_ttl: Duration::from_secs(10),
+            },
+        );
+
+        let pool1 =
+            ConnectionPool::from_pools(&pools, Duration::from_secs(2), Duration::from_secs(5));
+        let pool2 = ConnectionPool::from_pools_reusing(
+            &pools,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Some(&pool1),
+        );
+
+        let key = ("p1".to_string(), "b1".to_string());
+        assert!(Arc::ptr_eq(
+            &pool1.slots.get(&key).unwrap().semaphore,
+            &pool2.slots.get(&key).unwrap().semaphore
+        ));
+        assert!(Arc::ptr_eq(&pool1.dns_cache, &pool2.dns_cache));
+    }
+
+    #[test]
+    fn does_not_reuse_slot_when_config_changes() {
+        use crate::config::LbStrategyConfig;
+
+        let mut pools1 = HashMap::new();
+        pools1.insert(
+            "p1".to_string(),
+            CompiledPool {
+                name: "p1".to_string(),
+                strategy: LbStrategyConfig::RoundRobin,
+                backends: vec![CompiledBackend {
+                    id: "b1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 8080,
+                    authority: "127.0.0.1:8080".to_string(),
+                    weight: 1,
+                    tls: false,
+                    tls_sni: "127.0.0.1".to_string(),
+                    http2: false,
+                }],
+                max_connections_per_upstream: 16,
+                idle_ttl: Duration::from_secs(30),
+                passive_failure_threshold: 3,
+                passive_cooldown: Duration::from_secs(5),
+                allow_private_ip: true,
+                custom_ca_certs: Vec::new(),
+                client_cert_chain: Vec::new(),
+                client_key_pem: None,
+                health_check_path: None,
+                health_check_interval: Duration::from_secs(5),
+                max_idempotent_retries: 0,
+                dns_cache_ttl: Duration::from_secs(10),
+            },
+        );
+
+        let pool1 =
+            ConnectionPool::from_pools(&pools1, Duration::from_secs(2), Duration::from_secs(5));
+
+        let mut pools2 = pools1.clone();
+        pools2.get_mut("p1").unwrap().max_connections_per_upstream = 32;
+
+        let pool2 = ConnectionPool::from_pools_reusing(
+            &pools2,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Some(&pool1),
+        );
+
+        let key = ("p1".to_string(), "b1".to_string());
+        assert!(!Arc::ptr_eq(
+            &pool1.slots.get(&key).unwrap().semaphore,
+            &pool2.slots.get(&key).unwrap().semaphore
+        ));
+        assert!(Arc::ptr_eq(&pool1.dns_cache, &pool2.dns_cache));
+    }
+
+    #[tokio::test]
+    async fn dns_cache_bounded_eviction_when_exceeding_capacity() {
+        let pool = ConnectionPool::from_pools(
+            &HashMap::new(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let past = Instant::now() - Duration::from_secs(10);
+        let future = Instant::now() + Duration::from_secs(60);
+
+        pool.dns_cache.rcu(|current| {
+            let mut next = (**current).clone();
+            for i in 0..260 {
+                let exp = if i < 100 { past } else { future };
+                next.insert((format!("host-{i}.internal"), 80, true), (vec![], exp));
+            }
+            next
+        });
+
+        assert_eq!(pool.dns_cache.load().len(), 260);
+
+        let backend = CompiledBackend {
+            id: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 9099,
+            authority: "127.0.0.1:9099".to_string(),
+            weight: 1,
+            tls: false,
+            tls_sni: "127.0.0.1".to_string(),
+            http2: false,
+        };
+
+        let addrs = pool
+            .resolve_cached_or_lookup(&backend, true, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(!addrs.is_empty());
+        // Since len was > 256, expired entries (100 of them) were evicted!
+        assert!(pool.dns_cache.load().len() < 200);
     }
 }

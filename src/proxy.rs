@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http::header::{HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, HOST, RETRY_AFTER};
+use http::header::{
+    HeaderName, HeaderValue, ACCEPT, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_TYPE, HOST, ORIGIN,
+    RETRY_AFTER,
+};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
@@ -24,13 +27,14 @@ use subtle::ConstantTimeEq;
 use crate::auth::{
     HeaderTokenAuthenticator, TransportBoundAuthenticator, WorkloadAuthenticator, WorkloadIdentity,
 };
-use crate::config::{sha256_digest, CompiledConfig, CompiledWorkload};
+use crate::config::{sha256_digest, CompiledConfig, CompiledCorsConfig, CompiledWorkload};
 use crate::lb::{LoadBalancer, PoolLoadBalancer};
 use crate::policy::{DefaultDenyPolicyEngine, PolicyDecision, PolicyEngine};
 use crate::pool::ConnectionPool;
 use crate::router::{
     resolve_or_generate_traceparent, rewrite_upstream_path_and_query, sanitize_outbound_headers,
-    validate_request_path, Router, TRACEPARENT_HEADER, TRACE_ID_RESPONSE_HEADER,
+    sanitize_w3c_tracestate, validate_request_path, Router, TRACEPARENT_HEADER, TRACESTATE_HEADER,
+    TRACE_ID_RESPONSE_HEADER,
 };
 use crate::secrets::{MockSecretProvider, SecretProvider};
 use crate::telemetry::{ReplayRecord, Telemetry};
@@ -171,15 +175,23 @@ pub struct RuntimeSnapshot {
 
 impl RuntimeSnapshot {
     pub fn from_config(config: Arc<CompiledConfig>) -> Self {
+        Self::from_config_reusing(config, None)
+    }
+
+    pub fn from_config_reusing(
+        config: Arc<CompiledConfig>,
+        prev_pool: Option<&ConnectionPool>,
+    ) -> Self {
         let auth = Arc::new(HeaderTokenAuthenticator::new(config.workloads.clone()));
         let policy = Arc::new(DefaultDenyPolicyEngine::new(config.policies.clone()));
         let secrets = Arc::new(MockSecretProvider::from_compiled(config.secrets.clone()));
         let router = Router::new(config.routes.clone());
         let lb = Arc::new(PoolLoadBalancer::from_pools(&config.pools));
-        let pool = Arc::new(ConnectionPool::from_pools(
+        let pool = Arc::new(ConnectionPool::from_pools_reusing(
             &config.pools,
             config.connect_timeout,
             config.response_timeout,
+            prev_pool,
         ));
         Self {
             config,
@@ -198,7 +210,7 @@ impl RuntimeSnapshot {
 pub struct EdgeGateProxy {
     runtime: Arc<ArcSwap<RuntimeSnapshot>>,
     telemetry: Arc<Telemetry>,
-    bulkheads: Mutex<HashMap<(String, String), Arc<AtomicUsize>>>,
+    bulkheads: ArcSwap<HashMap<(String, String), Arc<AtomicUsize>>>,
 }
 
 impl EdgeGateProxy {
@@ -208,7 +220,27 @@ impl EdgeGateProxy {
         Self {
             runtime: Arc::new(ArcSwap::new(snapshot)),
             telemetry: Arc::new(Telemetry::with_replay_capacity(replay_cap)),
-            bulkheads: Mutex::new(HashMap::new()),
+            bulkheads: ArcSwap::new(Arc::new(HashMap::new())),
+        }
+    }
+
+    fn get_or_create_workload_counter(&self, org_id: &str, workload_id: &str) -> Arc<AtomicUsize> {
+        let key = (org_id.to_string(), workload_id.to_string());
+        let snap = self.bulkheads.load();
+        if let Some(c) = snap.get(&key) {
+            return Arc::clone(c);
+        }
+        let new_counter = Arc::new(AtomicUsize::new(0));
+        self.bulkheads.rcu(|current| {
+            let mut next = (**current).clone();
+            next.entry(key.clone())
+                .or_insert_with(|| Arc::clone(&new_counter));
+            Arc::new(next)
+        });
+        if let Some(c) = self.bulkheads.load().get(&key) {
+            Arc::clone(c)
+        } else {
+            new_counter
         }
     }
 
@@ -255,7 +287,11 @@ impl EdgeGateProxy {
     }
 
     fn swap_compiled(&self, compiled: Arc<CompiledConfig>) -> u64 {
-        let next = Arc::new(RuntimeSnapshot::from_config(compiled));
+        let prev = self.runtime.load();
+        let next = Arc::new(RuntimeSnapshot::from_config_reusing(
+            compiled,
+            Some(&prev.pool),
+        ));
         self.runtime.store(next);
         let gen = self.telemetry.record_reload_success();
         info!(
@@ -478,7 +514,53 @@ impl EdgeGateProxy {
                 .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             return resp;
         }
+
+        if path == "/_edgegate/console" {
+            if req.method() != Method::GET && req.method() != Method::HEAD {
+                return json_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            }
+            let body = if req.method() == Method::HEAD {
+                Bytes::new()
+            } else {
+                Bytes::from_static(crate::console::render_operator_console_html().as_bytes())
+            };
+            let mut resp = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static(crate::console::CONSOLE_CSP),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-frame-options"),
+                HeaderValue::from_static("DENY"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("referrer-policy"),
+                HeaderValue::from_static("no-referrer"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("no-store"),
+            );
+            return resp;
+        }
+
+        let snap = self.runtime.load_full();
+
         if path == "/_edgegate/metrics" {
+            if snap.config.protect_observability {
+                if let Err(err) = verify_admin_token(&snap, req.headers()) {
+                    return json_error_response(err.status_code(), &err.public_message());
+                }
+            }
             let wants_prom_query = req
                 .uri()
                 .query()
@@ -507,6 +589,11 @@ impl EdgeGateProxy {
             return resp;
         }
         if path == "/_edgegate/replay" {
+            if snap.config.protect_observability {
+                if let Err(err) = verify_admin_token(&snap, req.headers()) {
+                    return json_error_response(err.status_code(), &err.public_message());
+                }
+            }
             let body = Bytes::from(self.telemetry.replay_to_json());
             let mut resp = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
             *resp.status_mut() = StatusCode::OK;
@@ -514,8 +601,6 @@ impl EdgeGateProxy {
                 .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             return resp;
         }
-
-        let snap = self.runtime.load_full();
 
         // Step 0b: Authenticated Admin Control Plane (`Milestone 7` & `Milestone 8`).
         if path == "/_edgegate/admin/audit"
@@ -635,12 +720,95 @@ impl EdgeGateProxy {
             .get(ROUTING_KEY_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
+        let raw_origin_header = req_headers
+            .get(ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string());
+        let origin_header = raw_origin_header
+            .as_deref()
+            .map(|s| s.trim_end_matches('/').to_ascii_lowercase());
 
         // Step 1: Fail-closed pre-policy path validation.
         if let Err(err) = validate_request_path(&path) {
             return self.finish_error(
                 req_id, &trace_id, "-", "-", "-", "-", "BLOCKED", err, started,
             );
+        }
+
+        // CORS OPTIONS Preflight Short-Circuit (Before Step 2 Workload Auth, INV-27).
+        if method == Method::OPTIONS
+            && req_headers.contains_key(ORIGIN)
+            && req_headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD)
+        {
+            if let Some(route) = snap.router.match_route(&path, host_header.as_deref()) {
+                if let Some(ref cors) = route.cors {
+                    if let Some(ref origin) = origin_header {
+                        if cors.allowed_origins.contains(origin) {
+                            let origin_val_str = raw_origin_header.as_deref().unwrap_or(origin);
+                            if let Ok(origin_hv) = HeaderValue::from_str(origin_val_str) {
+                                let latency_us = started.elapsed().as_micros() as u64;
+                                self.telemetry.record_request(
+                                    req_id,
+                                    &trace_id,
+                                    "-",
+                                    "-",
+                                    &route.id,
+                                    "-",
+                                    "ALLOWED",
+                                    StatusCode::NO_CONTENT.as_u16(),
+                                    latency_us,
+                                );
+                                let mut resp = Response::new(
+                                    Full::new(Bytes::new())
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                );
+                                *resp.status_mut() = StatusCode::NO_CONTENT;
+                                resp.headers_mut().insert(
+                                    HeaderName::from_static("access-control-allow-origin"),
+                                    origin_hv,
+                                );
+                                resp.headers_mut().insert(
+                                    HeaderName::from_static("access-control-allow-methods"),
+                                    cors.allow_methods_value.clone(),
+                                );
+                                resp.headers_mut().insert(
+                                    HeaderName::from_static("access-control-allow-headers"),
+                                    cors.allow_headers_value.clone(),
+                                );
+                                resp.headers_mut().insert(
+                                    HeaderName::from_static("access-control-max-age"),
+                                    cors.max_age_value.clone(),
+                                );
+                                resp.headers_mut().insert(
+                                    HeaderName::from_static("vary"),
+                                    HeaderValue::from_static("Origin"),
+                                );
+                                if let Ok(trace_val) = HeaderValue::from_str(&trace_id) {
+                                    resp.headers_mut().insert(
+                                        HeaderName::from_static(TRACE_ID_RESPONSE_HEADER),
+                                        trace_val,
+                                    );
+                                }
+                                return resp;
+                            }
+                        }
+                    }
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        "-",
+                        "-",
+                        &route.id,
+                        "-",
+                        "BLOCKED",
+                        EdgeGateError::Forbidden(
+                            "CORS origin not allowed by route policy".to_string(),
+                        ),
+                        started,
+                    );
+                }
+            }
         }
 
         // Step 2: Authenticate workload (transport-bound UDS identity OR X-EdgeGate-Token header).
@@ -664,27 +832,20 @@ impl EdgeGateProxy {
         };
 
         // Step 2b: Per-workload concurrency quota / bulkhead isolation (INV-20).
+        let active_counter =
+            self.get_or_create_workload_counter(&identity.org_id, &identity.workload_id);
         let mut bulkhead_guard = if let Some(limit) = identity.max_concurrent_requests {
-            let counter = {
-                let mut guard = match self.bulkheads.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let key = (identity.org_id.clone(), identity.workload_id.clone());
-                guard
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-                    .clone()
-            };
             #[allow(deprecated)]
-            match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            match active_counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur < limit {
                     Some(cur + 1)
                 } else {
                     None
                 }
             }) {
-                Ok(_) => Some(WorkloadBulkheadGuard { active: counter }),
+                Ok(_) => Some(WorkloadBulkheadGuard {
+                    active: active_counter,
+                }),
                 Err(_) => {
                     self.telemetry.record_bulkhead_rejected();
                     self.telemetry.record_replay(ReplayRecord {
@@ -720,7 +881,10 @@ impl EdgeGateProxy {
                 }
             }
         } else {
-            None
+            active_counter.fetch_add(1, Ordering::AcqRel);
+            Some(WorkloadBulkheadGuard {
+                active: active_counter,
+            })
         };
 
         // Step 3: Match explicit route (default-deny unmatched destination).
@@ -740,6 +904,27 @@ impl EdgeGateProxy {
                 );
             }
         };
+
+        // CORS Actual Request Enforcement (INV-27).
+        if let Some(ref cors) = route.cors {
+            if let Some(ref orig) = origin_header {
+                if !cors.allowed_origins.contains(orig) {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        "-",
+                        "BLOCKED",
+                        EdgeGateError::Forbidden(
+                            "CORS origin not allowed by route policy".to_string(),
+                        ),
+                        started,
+                    );
+                }
+            }
+        }
 
         // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/query/headers policy + rate limit.
         let (rule_max_body_bytes, blocked_body_substrings, allowed_jsonrpc_methods) =
@@ -977,6 +1162,9 @@ impl EdgeGateProxy {
         if let Ok(tp_val) = HeaderValue::from_str(&traceparent) {
             outbound_headers.insert(HeaderName::from_static(TRACEPARENT_HEADER), tp_val);
         }
+        if let Some(ts_val) = sanitize_w3c_tracestate(&req_headers) {
+            outbound_headers.insert(HeaderName::from_static(TRACESTATE_HEADER), ts_val);
+        }
 
         let mut reflection_guard_secret = None;
         if let Some(ref binding) = route.credential {
@@ -1044,10 +1232,10 @@ impl EdgeGateProxy {
                     );
                 }
             };
-            let unix_s = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let unix_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(_) => 0,
+            };
             let ts_prefix = format!("{unix_s}.");
             let signing_input = [ts_prefix.as_bytes(), collected.as_ref()].concat();
             let sig_hex =
@@ -1079,6 +1267,87 @@ impl EdgeGateProxy {
                 );
             }
         };
+
+        if let Some(ref sigv4) = route.aws_sigv4 {
+            outbound_headers.remove(http::header::AUTHORIZATION);
+            outbound_headers.remove("x-amz-date");
+            outbound_headers.remove("x-amz-content-sha256");
+            outbound_headers.remove("x-amz-security-token");
+
+            let access_key = match snap
+                .secrets
+                .get_secret(&identity.org_id, &sigv4.access_key_ref)
+            {
+                Ok(k) => k,
+                Err(err) => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        &backend_id,
+                        "BLOCKED",
+                        err,
+                        started,
+                    );
+                }
+            };
+            let secret_key = match snap
+                .secrets
+                .get_secret(&identity.org_id, &sigv4.secret_key_ref)
+            {
+                Ok(k) => k,
+                Err(err) => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        &backend_id,
+                        "BLOCKED",
+                        err,
+                        started,
+                    );
+                }
+            };
+
+            let unix_s = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(_) => 0,
+            };
+            let (amz_date, date_stamp) = crate::config::format_amz_timestamps(unix_s);
+            let (canon_path, canon_query) = match upstream_pq.split_once('?') {
+                Some((p, q)) => (p, Some(q)),
+                None => (upstream_pq.as_str(), None),
+            };
+
+            let sig_headers = crate::config::compute_aws_sigv4_headers(
+                access_key.expose(),
+                secret_key.expose(),
+                &sigv4.region,
+                &sigv4.service,
+                method.as_str(),
+                canon_path,
+                canon_query,
+                &backend_authority,
+                &collected,
+                &amz_date,
+                &date_stamp,
+            );
+
+            if let Ok(val) = HeaderValue::from_str(&sig_headers.amz_date) {
+                outbound_headers.insert(HeaderName::from_static("x-amz-date"), val);
+            }
+            if let Ok(val) = HeaderValue::from_str(&sig_headers.content_sha256) {
+                outbound_headers.insert(HeaderName::from_static("x-amz-content-sha256"), val);
+            }
+            if let Ok(val) = HeaderValue::from_str(&sig_headers.authorization) {
+                outbound_headers.insert(http::header::AUTHORIZATION, val);
+            }
+            self.telemetry.record_signed_request();
+        }
 
         // Step 7: Forward through bounded pool (NO 3xx auto-follow; controlled retries only for idempotent methods).
         let max_retries = if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
@@ -1133,6 +1402,49 @@ impl EdgeGateProxy {
                     backend_id = next_lease.backend.id.clone();
                     if let Ok(host_val) = HeaderValue::from_str(&next_lease.backend.authority) {
                         outbound_headers.insert(HOST, host_val);
+                    }
+                    if let Some(ref sigv4) = route.aws_sigv4 {
+                        let (canon_path, canon_query) = match upstream_pq.split_once('?') {
+                            Some((p, q)) => (p, Some(q)),
+                            None => (upstream_pq.as_str(), None),
+                        };
+                        let unix_s = match std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                        {
+                            Ok(d) => d.as_secs(),
+                            Err(_) => 0,
+                        };
+                        let (amz_date, date_stamp) = crate::config::format_amz_timestamps(unix_s);
+                        if let (Ok(ak), Ok(sk)) = (
+                            snap.secrets
+                                .get_secret(&identity.org_id, &sigv4.access_key_ref),
+                            snap.secrets
+                                .get_secret(&identity.org_id, &sigv4.secret_key_ref),
+                        ) {
+                            let sig_headers = crate::config::compute_aws_sigv4_headers(
+                                ak.expose(),
+                                sk.expose(),
+                                &sigv4.region,
+                                &sigv4.service,
+                                method.as_str(),
+                                canon_path,
+                                canon_query,
+                                &next_lease.backend.authority,
+                                &collected,
+                                &amz_date,
+                                &date_stamp,
+                            );
+                            if let Ok(val) = HeaderValue::from_str(&sig_headers.amz_date) {
+                                outbound_headers.insert(HeaderName::from_static("x-amz-date"), val);
+                            }
+                            if let Ok(val) = HeaderValue::from_str(&sig_headers.content_sha256) {
+                                outbound_headers
+                                    .insert(HeaderName::from_static("x-amz-content-sha256"), val);
+                            }
+                            if let Ok(val) = HeaderValue::from_str(&sig_headers.authorization) {
+                                outbound_headers.insert(http::header::AUTHORIZATION, val);
+                            }
+                        }
                     }
                     lease = next_lease;
                 }
@@ -1201,7 +1513,11 @@ impl EdgeGateProxy {
                                     .downcast_ref::<http_body_util::LengthLimitError>()
                                     .is_some();
                                 if is_limit_exceeded {
-                                    snap.lb.record_success(&pool_name, &backend_id, latency_us);
+                                    if parts.status.is_server_error() {
+                                        snap.lb.record_failure(&pool_name, &backend_id);
+                                    } else {
+                                        snap.lb.record_success(&pool_name, &backend_id, latency_us);
+                                    }
                                     self.telemetry.record_replay(ReplayRecord {
                                         request_id: req_id,
                                         trace_id: trace_id.clone(),
@@ -1308,7 +1624,12 @@ impl EdgeGateProxy {
                         let body_reflected = body_bytes
                             .windows(needle.len())
                             .any(|window| window == needle);
-                        if body_reflected {
+                        let trailer_reflected = trailers.as_ref().is_some_and(|tr_map| {
+                            tr_map
+                                .values()
+                                .any(|v| v.as_bytes().windows(needle.len()).any(|w| w == needle))
+                        });
+                        if body_reflected || trailer_reflected {
                             let latency_us = started.elapsed().as_micros() as u64;
                             self.telemetry.record_secret_reflection_blocked();
                             self.telemetry.record_replay(ReplayRecord {
@@ -1416,6 +1737,12 @@ impl EdgeGateProxy {
                         .headers
                         .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
                 }
+                attach_cors_headers(
+                    &mut parts.headers,
+                    route.cors.as_ref(),
+                    origin_header.as_deref(),
+                    raw_origin_header.as_deref(),
+                );
                 let body = if !route.strip_response_headers.is_empty() {
                     let strip_headers = route.strip_response_headers.clone();
                     body.map_frame(move |mut frame| {
@@ -1430,16 +1757,12 @@ impl EdgeGateProxy {
                 } else {
                     body
                 };
-                let body = if !is_buffered {
-                    GuardedResponseBody {
-                        inner: body,
-                        _in_flight: in_flight_guard.take(),
-                        _bulkhead: bulkhead_guard.take(),
-                    }
-                    .boxed()
-                } else {
-                    body
-                };
+                let body = GuardedResponseBody {
+                    inner: body,
+                    _in_flight: in_flight_guard.take(),
+                    _bulkhead: bulkhead_guard.take(),
+                }
+                .boxed();
                 Response::from_parts(parts, body)
             }
             Err(err) => {
@@ -1469,7 +1792,7 @@ impl EdgeGateProxy {
                 } else {
                     "ERROR"
                 };
-                self.finish_error(
+                self.finish_error_cors(
                     req_id,
                     &trace_id,
                     &identity.org_id,
@@ -1479,6 +1802,9 @@ impl EdgeGateProxy {
                     decision,
                     err,
                     started,
+                    route.cors.as_ref(),
+                    origin_header.as_deref(),
+                    raw_origin_header.as_deref(),
                 )
             }
         }
@@ -1579,6 +1905,38 @@ impl EdgeGateProxy {
         err: EdgeGateError,
         started: Instant,
     ) -> Response<ProxyBody> {
+        self.finish_error_cors(
+            request_id,
+            trace_id,
+            org_id,
+            workload_id,
+            route,
+            upstream,
+            decision,
+            err,
+            started,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_error_cors(
+        &self,
+        request_id: u64,
+        trace_id: &str,
+        org_id: &str,
+        workload_id: &str,
+        route: &str,
+        upstream: &str,
+        decision: &str,
+        err: EdgeGateError,
+        started: Instant,
+        cors: Option<&CompiledCorsConfig>,
+        origin: Option<&str>,
+        raw_origin: Option<&str>,
+    ) -> Response<ProxyBody> {
         let status = err.status_code();
         let latency_us = started.elapsed().as_micros() as u64;
         self.telemetry.record_request(
@@ -1597,7 +1955,44 @@ impl EdgeGateProxy {
             resp.headers_mut()
                 .insert(HeaderName::from_static(TRACE_ID_RESPONSE_HEADER), trace_val);
         }
+        attach_cors_headers(resp.headers_mut(), cors, origin, raw_origin);
         resp
+    }
+}
+
+fn attach_cors_headers(
+    headers: &mut HeaderMap,
+    cors: Option<&CompiledCorsConfig>,
+    origin: Option<&str>,
+    raw_origin: Option<&str>,
+) {
+    if let (Some(cors), Some(orig)) = (cors, origin) {
+        if cors.allowed_origins.contains(orig) {
+            let orig_str = raw_origin.unwrap_or(orig);
+            if let Ok(val) = HeaderValue::from_str(orig_str) {
+                headers.insert(HeaderName::from_static("access-control-allow-origin"), val);
+                if let Some(existing_vary) = headers.get(http::header::VARY) {
+                    if let Ok(existing_str) = existing_vary.to_str() {
+                        if !existing_str.to_ascii_lowercase().contains("origin") {
+                            let combined = format!("{existing_str}, Origin");
+                            if let Ok(v) = HeaderValue::from_str(&combined) {
+                                headers.insert(http::header::VARY, v);
+                            }
+                        }
+                    } else {
+                        headers.insert(http::header::VARY, HeaderValue::from_static("Origin"));
+                    }
+                } else {
+                    headers.insert(http::header::VARY, HeaderValue::from_static("Origin"));
+                }
+                if let Some(ref exp) = cors.expose_headers_value {
+                    headers.insert(
+                        HeaderName::from_static("access-control-expose-headers"),
+                        exp.clone(),
+                    );
+                }
+            }
+        }
     }
 }
 

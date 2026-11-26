@@ -52,6 +52,12 @@ enum Command {
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+        /// Optional client certificate PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        /// Optional client private key PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_key: Option<PathBuf>,
     },
     /// Fetch live flight-recorder replay records (`/_edgegate/replay`) from a running EdgeGate instance.
     Replay {
@@ -60,6 +66,12 @@ enum Command {
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+        /// Optional client certificate PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        /// Optional client private key PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_key: Option<PathBuf>,
     },
     /// Fetch and verify the cryptographic SHA-256 hash-chained audit ledger (`/_edgegate/admin/audit`).
     Audit {
@@ -71,6 +83,12 @@ enum Command {
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+        /// Optional client certificate PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
+        /// Optional client private key PEM file for outbound mTLS client authentication.
+        #[arg(long)]
+        client_key: Option<PathBuf>,
         /// Allow sending admin token over cleartext HTTP to non-loopback hosts.
         #[arg(long)]
         allow_insecure_http: bool,
@@ -81,8 +99,18 @@ async fn fetch_endpoint(
     base_url: &str,
     endpoint_path: &str,
     ca_cert: Option<&Path>,
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
 ) -> Result<String, String> {
-    fetch_endpoint_with_header(base_url, endpoint_path, None, ca_cert).await
+    fetch_endpoint_with_header(
+        base_url,
+        endpoint_path,
+        None,
+        ca_cert,
+        client_cert,
+        client_key,
+    )
+    .await
 }
 
 async fn fetch_endpoint_with_header(
@@ -90,6 +118,8 @@ async fn fetch_endpoint_with_header(
     endpoint_path: &str,
     extra_header: Option<(&str, &str)>,
     ca_cert: Option<&Path>,
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
 ) -> Result<String, String> {
     let trimmed = base_url.trim_end_matches('/');
     let full_url = format!("{trimmed}{endpoint_path}");
@@ -100,6 +130,12 @@ async fn fetch_endpoint_with_header(
     let scheme = uri.scheme_str().unwrap_or("http");
     if ca_cert.is_some() && scheme != "https" {
         return Err("--ca-cert requires an https:// URL".to_string());
+    }
+    if client_cert.is_some() != client_key.is_some() {
+        return Err("both --client-cert and --client-key must be provided together".to_string());
+    }
+    if client_cert.is_some() && scheme != "https" {
+        return Err("--client-cert/--client-key requires an https:// URL".to_string());
     }
     let is_https = match scheme {
         "http" => false,
@@ -116,13 +152,11 @@ async fn fetch_endpoint_with_header(
         .ok_or_else(|| format!("missing host in URL '{full_url}'"))?;
     let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
     let authority = format!("{host}:{port}");
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(endpoint_path);
+    let path_and_query = uri.path_and_query().map_or(endpoint_path, |pq| pq.as_str());
 
-    let stream = TcpStream::connect(&authority)
+    let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&authority))
         .await
+        .map_err(|_| format!("connection timeout connecting to '{authority}'"))?
         .map_err(|e| format!("failed to connect to '{authority}': {e}"))?;
 
     let mut sender = if is_https {
@@ -140,11 +174,40 @@ async fn fetch_endpoint_with_header(
             }
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| format!("TLS version error: {e}"))?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+            .with_root_certificates(root_store);
+        let client_config = if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
+            let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+                format!("failed to read client_cert '{}': {e}", cert_path.display())
+            })?;
+            let mut cert_reader = std::io::Cursor::new(cert_pem.as_bytes());
+            let mut certs = Vec::new();
+            for cert_res in rustls_pemfile::certs(&mut cert_reader) {
+                let cert = cert_res.map_err(|e| format!("invalid client cert PEM: {e}"))?;
+                certs.push(cert);
+            }
+            if certs.is_empty() {
+                return Err(format!(
+                    "no certificates found in '{}'",
+                    cert_path.display()
+                ));
+            }
+
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|e| format!("failed to read client_key '{}': {e}", key_path.display()))?;
+            let mut key_reader = std::io::Cursor::new(key_pem.as_bytes());
+            let key = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| format!("failed to parse client private key: {e}"))?
+                .ok_or_else(|| format!("no private key found in '{}'", key_path.display()))?;
+
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| format!("invalid client auth cert/key configuration: {e}"))?
+        } else {
+            builder.with_no_client_auth()
+        };
         let connector = TlsConnector::from(Arc::new(client_config));
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| format!("invalid TLS server name '{host}': {e}"))?;
@@ -224,8 +287,21 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Status { url, ca_cert } => {
-            match fetch_endpoint(&url, "/_edgegate/metrics", ca_cert.as_deref()).await {
+        Command::Status {
+            url,
+            ca_cert,
+            client_cert,
+            client_key,
+        } => {
+            match fetch_endpoint(
+                &url,
+                "/_edgegate/metrics",
+                ca_cert.as_deref(),
+                client_cert.as_deref(),
+                client_key.as_deref(),
+            )
+            .await
+            {
                 Ok(body) => {
                     println!("{body}");
                     ExitCode::SUCCESS
@@ -236,8 +312,21 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Command::Replay { url, ca_cert } => {
-            match fetch_endpoint(&url, "/_edgegate/replay", ca_cert.as_deref()).await {
+        Command::Replay {
+            url,
+            ca_cert,
+            client_cert,
+            client_key,
+        } => {
+            match fetch_endpoint(
+                &url,
+                "/_edgegate/replay",
+                ca_cert.as_deref(),
+                client_cert.as_deref(),
+                client_key.as_deref(),
+            )
+            .await
+            {
                 Ok(body) => {
                     println!("{body}");
                     ExitCode::SUCCESS
@@ -252,6 +341,8 @@ async fn main() -> ExitCode {
             url,
             admin_token,
             ca_cert,
+            client_cert,
+            client_key,
             allow_insecure_http,
         } => {
             let uri: Uri = match url.parse() {
@@ -262,8 +353,8 @@ async fn main() -> ExitCode {
                 }
             };
             let scheme = uri.scheme_str().unwrap_or("http");
-            let host = uri.host().unwrap_or("");
-            let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+            let host = uri.host().unwrap_or_default();
+            let is_loopback = is_loopback_host(host);
             if (scheme == "http" || uri.scheme().is_none()) && !allow_insecure_http && !is_loopback
             {
                 error!(
@@ -286,6 +377,8 @@ async fn main() -> ExitCode {
                 "/_edgegate/admin/audit",
                 Some((ADMIN_TOKEN_HEADER, token.as_str())),
                 ca_cert.as_deref(),
+                client_cert.as_deref(),
+                client_key.as_deref(),
             )
             .await
             {
@@ -356,5 +449,31 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let clean = host.trim_matches(['[', ']']);
+    clean.eq_ignore_ascii_case("localhost")
+        || clean
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_full_ipv4_and_ipv6_loopback_ranges() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("127.255.255.254"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("example.com"));
     }
 }

@@ -7,7 +7,7 @@ Thank you for contributing to EdgeGate. Because EdgeGate operates as a security-
 ## 1. Development Setup
 
 ### Prerequisites
-- **Rust Toolchain:** Stable Rust 1.80+ with `rustfmt` and `clippy`:
+- **Rust Toolchain:** Stable Rust 1.85+ with `rustfmt` and `clippy`:
   ```bash
   rustup update stable
   rustup component add rustfmt clippy
@@ -59,6 +59,7 @@ Every non-trivial architectural or security design change must be recorded in [d
 - [008-milestone-8-outbound-mtls-egress-dlp-response-hardening-and-pool-introspection.md](docs/adr/008-milestone-8-outbound-mtls-egress-dlp-response-hardening-and-pool-introspection.md): Outbound mTLS, Egress DLP Payload Filtering, Response Header Hardening, and Pool Introspection
 - [009-milestone-9-workload-bulkheads-jsonrpc-mcp-allowlists-and-route-slas.md](docs/adr/009-milestone-9-workload-bulkheads-jsonrpc-mcp-allowlists-and-route-slas.md): Workload Bulkheads, JSON-RPC 2.0 / MCP Tool Allowlists, Route SLAs, and CLI Hardening
 - [010-milestone-10-v1-ga-hmac-request-signing-streaming-bulkheads-and-oss-packaging.md](docs/adr/010-milestone-10-v1-ga-hmac-request-signing-streaming-bulkheads-and-oss-packaging.md): Outbound HMAC-SHA256 Request Signing, Stream-Lifetime Bulkheads, and v1.0.0 GA Hardening
+- [011-milestone-11-enterprise-scalability-inbound-mtls-aws-sigv4-and-warm-reload-pools.md](docs/adr/011-milestone-11-enterprise-scalability-inbound-mtls-aws-sigv4-and-warm-reload-pools.md): Inbound mTLS, Outbound AWS SigV4 Request Signing, Wait-Free ArcSwap Hot Paths & Warm Connection Pool Reuse
 
 ### Security & Secret Hygiene
 - Never commit `.env` files, production API tokens, private keys, or PII/PHI test fixtures.

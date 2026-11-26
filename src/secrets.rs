@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use zeroize::ZeroizeOnDrop;
 
 use crate::config::CompiledSecret;
@@ -60,8 +61,10 @@ pub trait SecretProvider: Send + Sync {
 /// In-memory scoped secret provider supporting TTL expiration and live rotation (`Milestone 6`).
 #[derive(Debug, Clone)]
 pub struct MockSecretProvider {
-    secrets: Arc<Mutex<HashMap<(String, String), StoredSecret>>>,
+    secrets: Arc<ArcSwap<HashMap<(String, String), StoredSecret>>>,
 }
+
+pub type CatalogSecretProvider = MockSecretProvider;
 
 impl MockSecretProvider {
     pub fn from_map(raw: HashMap<(String, String), String>) -> Self {
@@ -78,7 +81,7 @@ impl MockSecretProvider {
             })
             .collect();
         Self {
-            secrets: Arc::new(Mutex::new(secrets)),
+            secrets: Arc::new(ArcSwap::from_pointee(secrets)),
         }
     }
 
@@ -96,18 +99,15 @@ impl MockSecretProvider {
             })
             .collect();
         Self {
-            secrets: Arc::new(Mutex::new(secrets)),
+            secrets: Arc::new(ArcSwap::from_pointee(secrets)),
         }
     }
 }
 
 impl SecretProvider for MockSecretProvider {
     fn get_secret(&self, org_id: &str, credential_ref: &str) -> Result<SecretValue, EdgeGateError> {
-        let guard = match self.secrets.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let stored = guard
+        let snap = self.secrets.load();
+        let stored = snap
             .get(&(org_id.to_string(), credential_ref.to_string()))
             .cloned()
             .ok_or_else(|| {
@@ -115,7 +115,6 @@ impl SecretProvider for MockSecretProvider {
                     "no scoped credential '{credential_ref}' configured for org '{org_id}'"
                 ))
             })?;
-        drop(guard);
 
         if let Some(exp) = stored.expires_at_epoch_s {
             let now_s = SystemTime::now()
@@ -138,17 +137,18 @@ impl SecretProvider for MockSecretProvider {
         new_value: String,
         expires_at_epoch_s: Option<u64>,
     ) {
-        let mut guard = match self.secrets.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.insert(
-            (org_id.to_string(), credential_ref.to_string()),
-            StoredSecret {
-                secret: SecretValue::new(new_value),
-                expires_at_epoch_s,
-            },
-        );
+        let key = (org_id.to_string(), credential_ref.to_string());
+        self.secrets.rcu(move |current| {
+            let mut next = (**current).clone();
+            next.insert(
+                key.clone(),
+                StoredSecret {
+                    secret: SecretValue::new(new_value.clone()),
+                    expires_at_epoch_s,
+                },
+            );
+            next
+        });
     }
 }
 
