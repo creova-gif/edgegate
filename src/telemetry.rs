@@ -22,7 +22,7 @@ pub struct ReplayRecord {
     pub latency_us: u64,
 }
 
-/// Atomic request, decision, rate-limit, shadow, reload, retry, reflection-guard, and flight-recorder telemetry (`Milestone 5`).
+/// Atomic request, decision, rate-limit, shadow, reload, retry, reflection-guard, secret-rotation, and flight-recorder telemetry (`Milestone 6`).
 #[derive(Debug)]
 pub struct Telemetry {
     request_seq: AtomicU64,
@@ -36,6 +36,7 @@ pub struct Telemetry {
     shadow_requests_total: AtomicU64,
     shadow_mismatches_total: AtomicU64,
     secret_reflections_blocked_total: AtomicU64,
+    secret_rotations_total: AtomicU64,
     retries_total: AtomicU64,
     in_flight_requests: AtomicU64,
     replay_capacity: usize,
@@ -54,6 +55,7 @@ pub struct TelemetrySnapshot {
     pub shadow_requests_total: u64,
     pub shadow_mismatches_total: u64,
     pub secret_reflections_blocked_total: u64,
+    pub secret_rotations_total: u64,
     pub retries_total: u64,
     pub in_flight_requests: u64,
 }
@@ -83,6 +85,7 @@ impl Telemetry {
             shadow_requests_total: AtomicU64::new(0),
             shadow_mismatches_total: AtomicU64::new(0),
             secret_reflections_blocked_total: AtomicU64::new(0),
+            secret_rotations_total: AtomicU64::new(0),
             retries_total: AtomicU64::new(0),
             in_flight_requests: AtomicU64::new(0),
             replay_capacity: cap,
@@ -113,6 +116,10 @@ impl Telemetry {
     pub fn record_secret_reflection_blocked(&self) {
         self.secret_reflections_blocked_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_secret_rotation(&self) {
+        self.secret_rotations_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reload_success(&self) -> u64 {
@@ -191,6 +198,7 @@ impl Telemetry {
             secret_reflections_blocked_total: self
                 .secret_reflections_blocked_total
                 .load(Ordering::Relaxed),
+            secret_rotations_total: self.secret_rotations_total.load(Ordering::Relaxed),
             retries_total: self.retries_total.load(Ordering::Relaxed),
             in_flight_requests: self.in_flight_requests.load(Ordering::Acquire),
         }
@@ -199,7 +207,7 @@ impl Telemetry {
     pub fn to_json(&self) -> String {
         let s = self.snapshot();
         format!(
-            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"retries_total\":{},\"in_flight_requests\":{}}}",
+            "{{\"allowed_total\":{},\"blocked_total\":{},\"rate_limited_total\":{},\"upstream_errors_total\":{},\"reloads_total\":{},\"reload_failures_total\":{},\"config_generation\":{},\"shadow_requests_total\":{},\"shadow_mismatches_total\":{},\"secret_reflections_blocked_total\":{},\"secret_rotations_total\":{},\"retries_total\":{},\"in_flight_requests\":{}}}",
             s.allowed_total,
             s.blocked_total,
             s.rate_limited_total,
@@ -210,12 +218,13 @@ impl Telemetry {
             s.shadow_requests_total,
             s.shadow_mismatches_total,
             s.secret_reflections_blocked_total,
+            s.secret_rotations_total,
             s.retries_total,
             s.in_flight_requests
         )
     }
 
-    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and gauges (`Milestone 5`).
+    /// Renders standard Prometheus text format (`# HELP` / `# TYPE`) for all counters and gauges (`Milestone 6`).
     pub fn to_prometheus(&self) -> String {
         let s = self.snapshot();
         format!(
@@ -249,6 +258,9 @@ impl Telemetry {
              # HELP edgegate_secret_reflections_blocked_total Total upstream responses blocked due to reflected injected secret.\n\
              # TYPE edgegate_secret_reflections_blocked_total counter\n\
              edgegate_secret_reflections_blocked_total {}\n\
+             # HELP edgegate_secret_rotations_total Total live in-memory secret rotations.\n\
+             # TYPE edgegate_secret_rotations_total counter\n\
+             edgegate_secret_rotations_total {}\n\
              # HELP edgegate_retries_total Total controlled idempotent upstream failover retries.\n\
              # TYPE edgegate_retries_total counter\n\
              edgegate_retries_total {}\n\
@@ -265,6 +277,7 @@ impl Telemetry {
             s.shadow_requests_total,
             s.shadow_mismatches_total,
             s.secret_reflections_blocked_total,
+            s.secret_rotations_total,
             s.retries_total,
             s.in_flight_requests
         )

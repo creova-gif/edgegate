@@ -83,7 +83,7 @@ impl RuntimeSnapshot {
     pub fn from_config(config: Arc<CompiledConfig>) -> Self {
         let auth = Arc::new(HeaderTokenAuthenticator::new(config.workloads.clone()));
         let policy = Arc::new(DefaultDenyPolicyEngine::new(config.policies.clone()));
-        let secrets = Arc::new(MockSecretProvider::from_map(config.secrets.clone()));
+        let secrets = Arc::new(MockSecretProvider::from_compiled(config.secrets.clone()));
         let router = Router::new(config.routes.clone());
         let lb = Arc::new(PoolLoadBalancer::from_pools(&config.pools));
         let pool = Arc::new(ConnectionPool::from_pools(
@@ -122,6 +122,20 @@ impl EdgeGateProxy {
 
     pub fn telemetry(&self) -> Arc<Telemetry> {
         Arc::clone(&self.telemetry)
+    }
+
+    /// Rotates a scoped credential live in-memory without a full configuration reload (`Milestone 6`).
+    pub fn rotate_secret(
+        &self,
+        org_id: &str,
+        credential_ref: &str,
+        new_value: String,
+        expires_at_epoch_s: Option<u64>,
+    ) {
+        let snap = self.runtime.load();
+        snap.secrets
+            .rotate_secret(org_id, credential_ref, new_value, expires_at_epoch_s);
+        self.telemetry.record_secret_rotation();
     }
 
     /// Atomically reloads configuration from disk without dropping in-flight requests.
@@ -472,8 +486,11 @@ impl EdgeGateProxy {
             }
         };
 
-        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path policy + rate limit.
-        match snap.policy.evaluate(&identity, &route.id, &method, &path) {
+        // Step 4: Evaluate default-deny org_id/workload/roles/route/method/path/headers policy + rate limit.
+        match snap
+            .policy
+            .evaluate_with_headers(&identity, &route.id, &method, &path, req.headers())
+        {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny { reason } => {
                 return self.finish_error(

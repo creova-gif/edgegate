@@ -34,12 +34,14 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     ▼                                                                            ║
 ║  [Step 2] Workload Authentication (`WorkloadAuthenticator`)                      ║
 ║     │     Resolves `WorkloadIdentity { workload_id, org_id, roles }`             ║
+║     │     (Supports zero-downtime primary + `secondary_token` rollover)          ║
 ║     ▼                                                                            ║
 ║  [Step 3] Deterministic Longest-Prefix & Host Router (`Router::match_route`)     ║
 ║     │                                                                            ║
 ║     ▼                                                                            ║
-║  [Step 4] Default-Deny Multi-Tenant RBAC Policy (`DefaultDenyPolicyEngine`)      ║
-║     │     Enforces `(org_id, workload_id, required_roles, route_id, method, pfx)`║
+║  [Step 4] Default-Deny Multi-Tenant RBAC & Attribute Policy (`PolicyEngine`)     ║
+║     │     Enforces `(org_id, workload_id, required_roles, route_id, method, pfx, ║
+║     │     required_headers)` for fine-grained L7 & MCP tool-call governance      ║
 ║     ▼                                                                            ║
 ║  [Step 5] Per-Workload Token-Bucket Rate Limiter (`TokenBucketRateLimiter`)      ║
 ║     │     Enforces `rate_limit_rps` & `rate_limit_burst` (`429 Too Many Reqs`)   ║
@@ -50,7 +52,8 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     ▼                                                                            ║
 ║  [Step 7] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
 ║     │     Strips hop-by-hop, `X-EdgeGate-Token`, `Proxy-Authorization`, forged   ║
-║     │     auth headers; injects W3C `traceparent` + `(org_id, credential_ref)`   ║
+║     │     auth headers; verifies secret TTL (`expires_at_epoch_s`, `403` on      ║
+║     │     expiry) and injects W3C `traceparent` + `(org_id, credential_ref)`     ║
 ║     ▼                                                                            ║
 ║  [Step 8] Bounded Body Collection (`http_body_util::Limited`, `413` on overflow) ║
 ║     │                                                                            ║
@@ -274,3 +277,20 @@ While EdgeGate strips all incoming auth headers and never follows `3xx` redirect
 
 ### Graceful In-Flight Connection Draining (`drain_timeout_ms`)
 Every active request increments an atomic `in_flight_requests` gauge via an RAII guard (`InFlightGuard`) that decrements on completion or cancellation. When the server receives a shutdown signal (`serve_until`), EdgeGate stops accepting new connections and waits up to `server.drain_timeout_ms` (default `5000 ms`) for `in_flight_requests` to reach `0` before terminating remaining tasks.
+
+---
+
+## 10. Scoped Credential Rotation, TTL Expiry, Request-Attribute Policies & Dual-Token Rollover (`Milestone 6`)
+
+### Scoped Credential Rotation & Fail-Closed TTL Expiry (`INV-14`)
+1. **TTL Deadline Enforcement (`expires_at_epoch_s`):** Each `[[secrets]]` entry may specify an optional `expires_at_epoch_s: Option<u64>`. During `SecretProvider::get_secret(&org_id, &credential_ref)`, EdgeGate compares the current system Unix epoch timestamp against `expires_at_epoch_s`. If `now >= expires_at_epoch_s`, EdgeGate immediately fails closed with `EdgeGateError::Forbidden` (`403 Forbidden`) before any upstream connection is dialed or header is injected.
+2. **Live In-Memory Rotation (`EdgeGateProxy::rotate_secret`):** Operators and control-plane supervisors can call `proxy.rotate_secret(org_id, credential_ref, new_value, expires_at_epoch_s)` at runtime to atomically replace a tenant's scoped secret in-memory without performing a full configuration file reload. The superseded `SecretValue` is automatically zeroized on drop (`ZeroizeOnDrop`), and `secret_rotations_total` is incremented for Prometheus and JSON telemetry.
+
+### Programmable Request-Attribute Policy Matching (`INV-15`)
+Policy rules (`[[policies]]`) support an optional `required_headers: HashMap<String, String>` map (e.g., `required_headers = { "x-mcp-tool" = "github.read_repo" }`).
+- Header names are normalized to lowercase `HeaderName` at configuration compile time.
+- During `DefaultDenyPolicyEngine::evaluate`, a rule matches only if **every** `(header_name, expected_value)` pair in `required_headers` is present on the incoming request with an exact string match.
+- This allows EdgeGate to act as an L7 attribute and Model Context Protocol (MCP) tool-call enforcement point alongside **Keelway MCP Gateway** and **IoRa**, ensuring an AI agent authorized to call an MCP endpoint can invoke `github.read_repo` while being blocked (`403 Forbidden`) from invoking `github.delete_repo` on the same route.
+
+### Zero-Downtime Dual Workload Token Rollover (`secondary_token` / `secondary_token_sha256`)
+Each `[[workloads]]` entry supports an optional `secondary_token` (or pre-hashed `secondary_token_sha256`) alongside the primary `token` / `token_sha256`. Both SHA-256 digests are registered in the compiled workload lookup table and verified using constant-time comparison (`subtle::ConstantTimeEq`), allowing orchestrators to roll workload bearer tokens with zero dropped requests during the rotation window.

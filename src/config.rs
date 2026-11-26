@@ -80,6 +80,11 @@ pub struct WorkloadConfig {
     /// Either plaintext `token` (hashed at startup for local dev/demo) or pre-hashed `token_sha256` (64 hex chars).
     pub token: Option<String>,
     pub token_sha256: Option<String>,
+    /// Optional secondary plaintext or pre-hashed SHA-256 token for zero-downtime token rollover (`Milestone 6`).
+    #[serde(default)]
+    pub secondary_token: Option<String>,
+    #[serde(default)]
+    pub secondary_token_sha256: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
 }
@@ -184,6 +189,9 @@ pub struct PolicyRuleConfig {
     pub methods: Vec<String>,
     #[serde(default = "default_path_prefix")]
     pub path_prefix: String,
+    /// Optional required request headers (`header_name -> expected_value`) (`Milestone 6`).
+    #[serde(default)]
+    pub required_headers: HashMap<String, String>,
     /// Optional token-bucket refill rate in requests per second (`Milestone 4`).
     #[serde(default)]
     pub rate_limit_rps: Option<u32>,
@@ -201,6 +209,9 @@ pub struct SecretEntryConfig {
     pub value: Option<String>,
     #[serde(default)]
     pub env: Option<String>,
+    /// Optional UNIX epoch expiration timestamp in seconds (`Milestone 6`).
+    #[serde(default)]
+    pub expires_at_epoch_s: Option<u64>,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -262,7 +273,13 @@ pub struct CompiledConfig {
     pub pools: HashMap<String, CompiledPool>,
     pub routes: Vec<CompiledRoute>,
     pub policies: Vec<CompiledPolicyRule>,
-    pub secrets: HashMap<(String, String), String>,
+    pub secrets: HashMap<(String, String), CompiledSecret>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSecret {
+    pub value: String,
+    pub expires_at_epoch_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +349,7 @@ pub struct CompiledPolicyRule {
     pub route_id: String,
     pub methods: HashSet<Method>,
     pub path_prefix: String,
+    pub required_headers: HashMap<String, String>,
     pub rate_limit_rps: Option<u32>,
     pub rate_limit_burst: Option<u32>,
 }
@@ -437,21 +455,51 @@ impl CompiledConfig {
                     )));
                 }
             };
+            let compiled_workload = CompiledWorkload {
+                workload_id: w.workload_id.clone(),
+                org_id: w.org_id,
+                roles: w.roles.into_iter().collect(),
+            };
             if workloads
-                .insert(
-                    digest,
-                    CompiledWorkload {
-                        workload_id: w.workload_id.clone(),
-                        org_id: w.org_id,
-                        roles: w.roles.into_iter().collect(),
-                    },
-                )
+                .insert(digest, compiled_workload.clone())
                 .is_some()
             {
                 return Err(EdgeGateError::Config(format!(
                     "duplicate workload token detected for '{}'",
                     w.workload_id
                 )));
+            }
+            let secondary_digest = match (w.secondary_token, w.secondary_token_sha256) {
+                (Some(plain), None) => {
+                    if plain.is_empty() {
+                        return Err(EdgeGateError::Config(format!(
+                            "workload '{}' has empty secondary_token",
+                            w.workload_id
+                        )));
+                    }
+                    Some(sha256_digest(plain.as_bytes()))
+                }
+                (None, Some(hex_hash)) => Some(decode_sha256_hex(&hex_hash).map_err(|msg| {
+                    EdgeGateError::Config(format!(
+                        "workload '{}' invalid secondary_token_sha256: {msg}",
+                        w.workload_id
+                    ))
+                })?),
+                (Some(_), Some(_)) => {
+                    return Err(EdgeGateError::Config(format!(
+                        "workload '{}' cannot set both secondary_token and secondary_token_sha256",
+                        w.workload_id
+                    )));
+                }
+                (None, None) => None,
+            };
+            if let Some(sec_digest) = secondary_digest {
+                if workloads.insert(sec_digest, compiled_workload).is_some() {
+                    return Err(EdgeGateError::Config(format!(
+                        "duplicate workload secondary_token detected for '{}'",
+                        w.workload_id
+                    )));
+                }
             }
         }
 
@@ -669,6 +717,23 @@ impl CompiledConfig {
                     })?;
                 methods.insert(parsed);
             }
+            let mut required_headers = HashMap::with_capacity(pol.required_headers.len());
+            for (k, v) in pol.required_headers {
+                let lower_key = k.trim().to_ascii_lowercase();
+                if lower_key.is_empty() {
+                    return Err(EdgeGateError::Config(format!(
+                        "policy for route '{}' has empty required_headers key",
+                        pol.route_id
+                    )));
+                }
+                HeaderName::from_bytes(lower_key.as_bytes()).map_err(|e| {
+                    EdgeGateError::Config(format!(
+                        "policy for route '{}' invalid required_headers key '{k}': {e}",
+                        pol.route_id
+                    ))
+                })?;
+                required_headers.insert(lower_key, v);
+            }
             policies.push(CompiledPolicyRule {
                 org_id: pol.org_id,
                 workload_id: pol.workload_id,
@@ -676,6 +741,7 @@ impl CompiledConfig {
                 route_id: pol.route_id,
                 methods,
                 path_prefix: pol.path_prefix,
+                required_headers,
                 rate_limit_rps: pol.rate_limit_rps,
                 rate_limit_burst: pol.rate_limit_burst,
             });
@@ -709,7 +775,13 @@ impl CompiledConfig {
                     )));
                 }
             };
-            secrets.insert((s.org_id, s.credential_ref), resolved_value);
+            secrets.insert(
+                (s.org_id, s.credential_ref),
+                CompiledSecret {
+                    value: resolved_value,
+                    expires_at_epoch_s: s.expires_at_epoch_s,
+                },
+            );
         }
 
         Ok(Self {

@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::ZeroizeOnDrop;
 
+use crate::config::CompiledSecret;
 use crate::EdgeGateError;
 
 /// Redacted, zeroized-on-drop wrapper around raw upstream credential bytes.
@@ -34,37 +37,118 @@ impl fmt::Display for SecretValue {
     }
 }
 
-/// Trait seam for scoped credential retrieval (M1 mock provider; M2 GCP Secret Manager / Vault).
-pub trait SecretProvider: Send + Sync {
-    fn get_secret(&self, org_id: &str, credential_ref: &str) -> Result<SecretValue, EdgeGateError>;
+#[derive(Debug, Clone)]
+pub struct StoredSecret {
+    pub secret: SecretValue,
+    pub expires_at_epoch_s: Option<u64>,
 }
 
-/// In-memory scoped secret provider for Milestone 1.
+/// Trait seam for scoped credential retrieval and live rotation (`Milestone 6`).
+pub trait SecretProvider: Send + Sync {
+    fn get_secret(&self, org_id: &str, credential_ref: &str) -> Result<SecretValue, EdgeGateError>;
+
+    fn rotate_secret(
+        &self,
+        _org_id: &str,
+        _credential_ref: &str,
+        _new_value: String,
+        _expires_at_epoch_s: Option<u64>,
+    ) {
+    }
+}
+
+/// In-memory scoped secret provider supporting TTL expiration and live rotation (`Milestone 6`).
 #[derive(Debug, Clone)]
 pub struct MockSecretProvider {
-    secrets: HashMap<(String, String), SecretValue>,
+    secrets: Arc<Mutex<HashMap<(String, String), StoredSecret>>>,
 }
 
 impl MockSecretProvider {
     pub fn from_map(raw: HashMap<(String, String), String>) -> Self {
         let secrets = raw
             .into_iter()
-            .map(|(k, v)| (k, SecretValue::new(v)))
+            .map(|(k, v)| {
+                (
+                    k,
+                    StoredSecret {
+                        secret: SecretValue::new(v),
+                        expires_at_epoch_s: None,
+                    },
+                )
+            })
             .collect();
-        Self { secrets }
+        Self {
+            secrets: Arc::new(Mutex::new(secrets)),
+        }
+    }
+
+    pub fn from_compiled(raw: HashMap<(String, String), CompiledSecret>) -> Self {
+        let secrets = raw
+            .into_iter()
+            .map(|(k, cs)| {
+                (
+                    k,
+                    StoredSecret {
+                        secret: SecretValue::new(cs.value),
+                        expires_at_epoch_s: cs.expires_at_epoch_s,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            secrets: Arc::new(Mutex::new(secrets)),
+        }
     }
 }
 
 impl SecretProvider for MockSecretProvider {
     fn get_secret(&self, org_id: &str, credential_ref: &str) -> Result<SecretValue, EdgeGateError> {
-        self.secrets
+        let guard = match self.secrets.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let stored = guard
             .get(&(org_id.to_string(), credential_ref.to_string()))
             .cloned()
             .ok_or_else(|| {
                 EdgeGateError::Forbidden(format!(
                     "no scoped credential '{credential_ref}' configured for org '{org_id}'"
                 ))
-            })
+            })?;
+        drop(guard);
+
+        if let Some(exp) = stored.expires_at_epoch_s {
+            let now_s = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now_s >= exp {
+                return Err(EdgeGateError::Forbidden(format!(
+                    "scoped credential '{credential_ref}' for org '{org_id}' has expired"
+                )));
+            }
+        }
+        Ok(stored.secret)
+    }
+
+    fn rotate_secret(
+        &self,
+        org_id: &str,
+        credential_ref: &str,
+        new_value: String,
+        expires_at_epoch_s: Option<u64>,
+    ) {
+        let mut guard = match self.secrets.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(
+            (org_id.to_string(), credential_ref.to_string()),
+            StoredSecret {
+                secret: SecretValue::new(new_value),
+                expires_at_epoch_s,
+            },
+        );
     }
 }
 
