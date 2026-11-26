@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-11-26
+
+EdgeGate `v1.1.0` introduces enterprise scalability, inbound mutual TLS (mTLS), native AWS Signature Version 4 (SigV4) cloud request signing, wait-free hot-path concurrency, warm connection pool reuse across hot reloads, and multi-platform release distribution.
+
+### Added
+- **Embedded WCAG 2.1 AA+ Operator Control-Plane Web Console (`INV-26`, `GET /_edgegate/console`, `src/console.rs`):**
+  - Serves an embedded, zero-dependency, self-contained operator control-plane console compiled directly into the binary.
+  - Adaptive design system supporting `prefers-color-scheme` (dark/light) with >= 7:1 contrast ratios and `prefers-reduced-motion`.
+  - Accessible keyboard navigation featuring top skip-links, WAI-ARIA landmark roles (`banner`, `main`, `region`, `status`), and `aria-live="polite"` real-time telemetry announcements.
+  - Hardened with strict `Content-Security-Policy` (`default-src 'none'`, `frame-ancestors 'none'`) and ephemeral in-memory admin token handling with zero persistence in `localStorage`, cookies, or browser history.
+- **Route-Level CORS Preflight & Browser/MCP Interoperability (`INV-27`, `[routes.cors]`):**
+  - Declarative route-level CORS policies (`allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, `max_age_s`).
+  - Strict origin validation forbidding wildcard `*` origins when credentials are enabled.
+  - Zero-secret `OPTIONS` preflight short-circuiting returning `204 No Content` with `Vary: Origin` before upstream connection checkout or secret injection.
+- **W3C `tracestate` Distributed Tracing Interoperability (`src/router.rs`):**
+  - Full W3C Trace Context Level 1 validation ensuring `tracestate` contains only printable ASCII, `<= 512` bytes, and `<= 32` `key=value` list members.
+  - Upstream and shadow propagation alongside `traceparent` for OpenTelemetry, Datadog, Jaeger, and AWS X-Ray context tracing.
+- **Inbound Mutual TLS (`mTLS`) Client Verification (`INV-24`, `[server.tls]`):**
+  - Added `client_ca_cert_pem` and `client_ca_cert_path` to `[server.tls]` configuration.
+  - Enforces hardware/sidecar X.509 client certificate validation at the inbound TLS listener via `rustls::server::WebPkiClientVerifier`.
+  - Added `--client-cert` and `--client-key` CLI options to `edgegate status`, `edgegate replay`, and `edgegate audit` to authenticate against mTLS-protected gateways.
+- **Outbound AWS Signature Version 4 (`SigV4`) Cloud Request Signing (`INV-25`, `[routes.aws_sigv4]`):**
+  - Native zero-secret canonical AWS SigV4 request signing (`AWS4-HMAC-SHA256`, `x-amz-date`, `x-amz-content-sha256`) for Amazon S3, Amazon Bedrock, DynamoDB, Cloudflare R2, and MinIO backends.
+  - Organization-scoped secret resolution for AWS access keys and secret keys with fail-closed TTL enforcement (`INV-14`).
+  - Automatic stripping of caller-forged `Authorization` and `x-amz-*` headers prior to signing.
+  - Compile-time validation preventing conflicting `credential`, `request_signing`, and `aws_sigv4` definitions on the same route.
+  - Added telemetry counter `aws_sigv4_signed_requests_total` (`edgegate_aws_sigv4_signed_requests_total`).
+- **Wait-Free Hot-Path Concurrency & Warm Pool Reuse across Live Hot Reloads:**
+  - Migrated `SecretProvider::get_secret` and workload bulkhead lookups to lock-free `ArcSwap` pointers, eliminating `Mutex` lock contention under heavy multi-core load.
+  - Added configurable `dns_cache_ttl_ms` on `[server]` for bounded caching of SSRF-validated upstream socket addresses.
+  - Enabled warm `UpstreamSlot` connection pool reuse across atomic `ArcSwap` configuration reloads, preserving active HTTP/2 multiplexed connections and idle HTTP/1.1 pools.
+- **Optional Observability Endpoint Authentication (`protect_observability`):**
+  - Added `protect_observability = true` on `[server]` to restrict `GET /_edgegate/metrics` and `GET /_edgegate/replay` behind constant-time `X-EdgeGate-Admin-Token` authentication in multi-tenant environments.
+  - `GET /_edgegate/healthz` remains unauthenticated for orchestrator (Kubernetes, Nomad) liveness/readiness probes.
+- **HTTP/2 Response Trailer Credential-Reflection Scanning (`INV-12` Hardening):**
+  - Hardened `block_secret_reflection = true` to scan HTTP/2 response trailers (`BufferedBodyWithTrailers`) for reflected credentials, dropping trailers and failing closed with `502 Bad Gateway` if matched.
+- **Multi-Platform Release CI & Packaging Matrix:**
+  - Upgraded `.github/workflows/release.yml` with a 2-target build matrix (`x86_64-unknown-linux-gnu` on `ubuntu-latest` and `aarch64-apple-darwin` on `macos-14`).
+  - Added automated publication of unified `SHA256SUMS` covering Linux and macOS release archives.
+
+### Performance
+- **Measured 2.36x Throughput Gain & -50.9% p95 Latency Reduction:**
+  - Upstream keep-alive benchmarking via `cargo run --release --example bench` (32 concurrent workers × 500 requests = 16,000 requests on Apple Silicon loopback) demonstrated:
+    - Gateway throughput increased from `27,458.3 req/s` (`v1.0.0`) to **`64,854.4 req/s`** (**`2.36x` / `+136.2%` gain**).
+    - Gateway `p95` latency dropped from `1,300 µs` to **`692 µs`** (**`-50.9%` reduction**).
+    - Added EdgeGate `p95` overhead reduced from `+906 µs` down to **`+445 µs`** (`0.445 ms`).
+  - Achieved by resolving `PooledBody` HTTP/1.1 keep-alive EOF return conditions, eliminating hot-path `Mutex` contention via wait-free `ArcSwap` pointers, and deploying SSRF-validated DNS caching.
+
+### Changed
+- Standardized minimum supported Rust toolchain prerequisite to Rust 1.85+ across documentation, Dockerfiles, and CI configurations.
+
+---
+
 ## [1.0.0] - 2026-11-26
 
 EdgeGate `v1.0.0` marks General Availability (GA) as a production-grade, panic-free Layer 7 zero-secret reverse proxy and AI workload gateway. This release completes the GA hardening milestone with cryptographic outbound request signing, end-to-end stream-lifetime concurrency bulkheads, graceful draining guards, trailer-preserving response caps, and strict JSON-RPC 2.0 conformance.

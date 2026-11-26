@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod console;
 pub mod lb;
 pub mod policy;
 pub mod pool;

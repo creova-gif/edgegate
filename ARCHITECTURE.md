@@ -26,10 +26,11 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                              EdgeGate L7 Data Plane                              ║
 ║                                                                                  ║
-║  [Step 0] Observability (`/_edgegate/healthz`, `/metrics`, `/replay`) &          ║
+║  [Step 0] Observability (`/_edgegate/healthz`, `/metrics`, `/replay`, `/console`) &  ║
 ║     │     Authenticated Admin Control Plane (`/_edgegate/admin/{reload,          ║
 ║     │     secrets/rotate,audit,pools}`, constant-time `X-EdgeGate-Admin-Token`,  ║
-║     │     disabled fail-closed when `admin_token` is unconfigured)               ║
+║     │     disabled fail-closed when `admin_token` is unconfigured) &              ║
+║     │     Embedded WCAG 2.1 AA+ Operator Console (GET /_edgegate/console, INV-26)║
 ║     ▼                                                                            ║
 ║  [Step 1] Fail-Closed Path Normalization Guard (`validate_request_path`)         ║
 ║     │     Rejects `..`, `%2e`, `%2f`, `%5c`, `\`, `%00`, `//`, control chars     ║
@@ -39,7 +40,8 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     (Supports zero-downtime primary + `secondary_token` rollover)          ║
 ║     ▼                                                                            ║
 ║  [Step 3] Deterministic Longest-Prefix & Host Router (`Router::match_route`)     ║
-║     │                                                                            ║
+║     │     • Matches route and evaluates route-level CORS preflight (INV-27)      ║
+║     │     • Short-circuits OPTIONS requests with 204 No Content & zero secrets   ║
 ║     ▼                                                                            ║
 ║  [Step 4] Default-Deny Multi-Tenant RBAC, Attribute & Query Policy (`INV-15/17`) ║
 ║     │     Enforces `(org_id, workload_id, required_roles, route_id, method, pfx, ║
@@ -60,11 +62,11 @@ EdgeGate eliminates both failure modes by acting as an **explicit, default-deny 
 ║     │     Weighted `RoundRobin` | `LeastConnections` | `ConsistentHash` | `EWMA` ║
 ║     │     Acquires RAII `BackendLease` (`Closed` / `Open` / `HalfOpen` probe)    ║
 ║     ▼                                                                        ║
-║  [Step 8] Outbound Header Sanitization, W3C `traceparent` & Credential Injection ║
+║  [Step 8] Outbound Header Sanitization, W3C Tracing & Credential Injection       ║
 ║     │     Strips hop-by-hop, `X-EdgeGate-Token`, forged auth, & HMAC signature/  ║
 ║     │     timestamp headers; verifies secret TTL (`expires_at_epoch_s`, `403`    ║
-║     │     on expiry) and injects W3C `traceparent`, `(org_id, credential_ref)`,  ║
-║     │     & outbound HMAC-SHA256 request signing (`INV-23`)                      ║
+║     │     on expiry) and injects W3C `traceparent` & `tracestate`, `(org_id,     ║
+║     │     credential_ref)`, HMAC-SHA256 (`INV-23`) / AWS SigV4 (`INV-25`)        ║
 ║     ▼                                                                            ║
 ║  [Step 9] Bounded Connection Pool + Outbound mTLS (`INV-18`) + SSRF + Failover   ║
 ║     │     • DNS resolve -> IPv4/IPv6/mapped-v6 blocklist -> dial `SocketAddr`    ║
@@ -401,13 +403,12 @@ Modern AI agent architectures frequently interact with external webhooks, API ga
 - **Declarative Route Signing Configuration:** Routes (`[[routes]]`) support optional `[routes.request_signing]`:
   ```toml
   [routes.request_signing]
-  key_ref = "webhook_hmac_key"              # Resolves org-scoped secret in [[secrets]]
-  algorithm = "hmac_sha256"                 # Validated pure-Rust RFC 2104 HMAC-SHA256
-  header_name = "X-EdgeGate-Signature-256"  # Header receiving sha256=<hex_digest>
-  timestamp_header = "X-EdgeGate-Timestamp" # Header receiving Unix epoch seconds
+  credential_ref = "webhook_hmac_key"          # Resolves org-scoped secret in [[secrets]]
+  signature_header = "X-EdgeGate-Signature-256" # Header receiving sha256=<hex_digest>
+  timestamp_header = "X-EdgeGate-Timestamp"     # Header receiving Unix epoch seconds
   ```
-- **Forged Signature Stripping:** In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), EdgeGate unconditionally strips incoming caller-provided `X-EdgeGate-Signature-256` and `X-EdgeGate-Timestamp` headers prior to signature generation, ensuring that sandboxes cannot forge or manipulate outbound cryptographic signatures.
-- **Fail-Closed Secret & TTL Resolution:** The signing key is retrieved from `SecretProvider` scoped to `(identity.org_id, signing.key_ref)`. If the secret is missing or has expired according to its `expires_at_epoch_s` TTL, EdgeGate immediately rejects the request fail-closed with `403 Forbidden` (`INV-14`).
+- **Forged Signature Stripping:** In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), EdgeGate unconditionally strips incoming caller-provided `signature_header` and `timestamp_header` values prior to signature generation, ensuring that sandboxes cannot forge or manipulate outbound cryptographic signatures.
+- **Fail-Closed Secret & TTL Resolution:** The signing key is retrieved from `SecretProvider` scoped to `(identity.org_id, signing.credential_ref)`. If the secret is missing or has expired according to its `expires_at_epoch_s` TTL, EdgeGate immediately rejects the request fail-closed with `403 Forbidden` (`INV-14`).
 - **Canonical Envelope & Hex Computation:** EdgeGate captures the current Unix epoch timestamp in seconds, constructs the canonical signing buffer `<timestamp>.<raw_body>` (using an empty byte slice for empty bodies), computes the RFC 2104 HMAC-SHA256 digest, formats the header value as `sha256=<lowercase_hex>`, and injects both the timestamp and signature headers onto the outbound request.
 - **Telemetry:** Every signed dispatch increments `signed_requests_total` (`edgegate_signed_requests_total` in Prometheus format).
 
@@ -427,3 +428,72 @@ In streaming environments (Server-Sent Events / SSE, gRPC bidirectional streams,
 ### CLI Cleartext Admin Protection & Production Packaging
 - **Insecure HTTP Rejection:** The `edgegate audit` CLI refuses to transmit administrative credentials (`X-EdgeGate-Admin-Token`) over cleartext `http://` to non-loopback hosts unless `--allow-insecure-http` is explicitly specified. Passing `--ca-cert` with an `http://` URL is rejected as invalid.
 - **Deterministic Release Packaging:** EdgeGate builds locked, standalone release binaries packaged with SHA-256 checksums (`SHA256SUMS`) and minimal container images for zero-dependency edge deployments.
+
+---
+
+## 15. Enterprise Scalability, Inbound mTLS, AWS SigV4 & Warm Reload Pools (`Milestone 11` / `v1.1.0`)
+
+### Wait-Free Hot-Path Concurrency, Validated TTL DNS Caching & Warm Connection Pools
+High-throughput enterprise AI gateway deployments require continuous linear scalability across dozens of CPU cores and uninterrupted traffic flow during frequent configuration reloads:
+- **Wait-Free Secret & Bulkhead Lookups:** In `v1.0.0`, internal secret lookup tables (`SecretProvider`) and workload bulkhead permit lookups (`WorkloadAuthenticator`) relied on internal `std::sync::Mutex` synchronizations. In `v1.1.0`, these hot-path lookups are implemented using `ArcSwap` pointers (`ArcSwap<Arc<HashMap<...>>>`). Arriving requests perform lock-free, wait-free pointer dereferences on the data plane with zero mutex contention. Runtime updates (secret rotation, config hot reloads) compile replacement maps off-thread and atomically swap the pointer.
+- **Bounded SSRF-Validated DNS Cache (`dns_cache_ttl_ms`):** Resolving upstream socket addresses on every new connection creates DNS overhead and potential latency spikes. When `dns_cache_ttl_ms` is configured on `[server]`, EdgeGate caches the resolved and anti-SSRF validated `Vec<SocketAddr>` for each upstream host. Anti-SSRF invariants (`INV-07`) are enforced strictly at cache insertion time, ensuring DNS lookups are pruned without compromising network safety boundaries.
+- **Warm Connection Pool Reuse Across Atomic Hot Reloads:** When `ArcSwap<RuntimeSnapshot>` performs a live configuration hot reload, `ConnectionPool` identifies surviving upstream backends whose target parameters (`address`, `tls`, `http2`, `mtls`) remain unchanged. Rather than tearing down established sockets, EdgeGate transfers existing `UpstreamSlot` instances—preserving active HTTP/2 multiplexed connections and warm idle HTTP/1.1 keep-alive pools—eliminating cold-start latency spikes.
+
+### Inbound Mutual TLS (mTLS) Client Verification (`INV-24`, `[server.tls]`)
+In zero-trust topologies and hardware enclave sidecar architectures, authenticating client identity at the transport layer is critical:
+- **Declarative Inbound Client CA Configuration:** Operators configure `client_ca_cert_pem` (inline PEM) or `client_ca_cert_path` (file path) within `[server.tls]`.
+- **`WebPkiClientVerifier` Handshake Enforcement:** At startup and hot-reload time, EdgeGate compiles the configured CA certificates into a `rustls::server::WebPkiClientVerifier`. Incoming TLS 1.2 and 1.3 handshakes mandate the presentation of an X.509 client certificate signed by the trusted authority. Connections without valid client certificates are terminated at the TLS handshake level before any HTTP framing bytes are processed.
+- **Operator CLI Client Certificate Authentication:** The `edgegate` CLI (`status`, `replay`, `audit`) supports `--client-cert <PATH>` and `--client-key <PATH>` arguments to authenticate operator commands against mTLS-protected gateways.
+
+### Outbound AWS Signature Version 4 (SigV4) Cloud Request Signing (`INV-25`, `[routes.aws_sigv4]`)
+Untrusted sandboxes requiring access to cloud object storage (Amazon S3, Cloudflare R2, MinIO) or LLM endpoints (Amazon Bedrock) cannot hold raw AWS access/secret keys:
+- **Declarative AWS SigV4 Route Configuration:** Routes (`[[routes]]`) support optional `[routes.aws_sigv4]`:
+  ```toml
+  [routes.aws_sigv4]
+  access_key_ref = "aws_access_key"            # Resolves org-scoped access key in [[secrets]]
+  secret_key_ref = "aws_secret_key"            # Resolves org-scoped secret key in [[secrets]]
+  region = "us-east-1"
+  service = "s3"                                # e.g. "s3", "bedrock", "dynamodb"
+  ```
+- **Compile-Time Header Collision Validation:** EdgeGate validates that a route cannot simultaneously declare `credential`, `request_signing`, and `aws_sigv4` bindings, preventing contradictory header mutations.
+- **Caller-Forged Header Stripping:** In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), EdgeGate unconditionally strips incoming caller-provided `Authorization`, `x-amz-date`, `x-amz-content-sha256`, and all `x-amz-*` headers prior to signing.
+- **Canonical SigV4 Request Construction:** EdgeGate resolves `access_key_id` and `secret_access_key` via `SecretProvider` scoped to `identity.org_id`, validates `expires_at_epoch_s` TTL deadlines (`INV-14`), computes payload digest `x-amz-content-sha256`, formats UTC timestamp `x-amz-date`, derives the standard AWS SigV4 signing key (`kSigning`), computes the canonical request and string-to-sign, and injects the canonical `Authorization: AWS4-HMAC-SHA256 Credential=...` header.
+- **Telemetry:** Injected AWS SigV4 dispatches increment `aws_sigv4_signed_requests_total` (`edgegate_aws_sigv4_signed_requests_total` in Prometheus format).
+
+### Optional Observability Authentication & Trailer Credential-Reflection Scanning (`INV-12` Hardening)
+- **Multi-Tenant Observability Protection (`protect_observability`):** When `protect_observability = true` is configured in `[server]`, `GET /_edgegate/metrics` and `GET /_edgegate/replay` require constant-time `X-EdgeGate-Admin-Token` authentication (failing closed with `401 Unauthorized` or `403 Forbidden`). Meanwhile, `GET /_edgegate/healthz` remains unauthenticated to allow Kubernetes and Nomad liveness/readiness probes to operate without administrative token exposure.
+- **HTTP/2 Trailer Credential-Reflection Scanning (`INV-12` Hardening):** When `block_secret_reflection = true` is configured, EdgeGate inspects HTTP/2 response trailers (`BufferedBodyWithTrailers`) in addition to headers and body bytes. If injected secret bytes appear in trailing headers, EdgeGate immediately terminates the stream, increments `secret_reflections_blocked_total`, and fails closed with `502 Bad Gateway`.
+
+---
+
+## 16. UI/UX Accessibility, Route-Level CORS & Distributed Tracing Interoperability (`INV-26`, `INV-27`)
+
+### Embedded WCAG 2.1 AA+ Operator Control-Plane Web Console (`GET /_edgegate/console`, `src/console.rs`, `INV-26`)
+EdgeGate embeds a zero-dependency, self-contained administrative and observability web console directly within the compiled binary, accessible at `GET /_edgegate/console`:
+- **WCAG 2.1 AA+ Design System & Accessibility:** Built from the ground up for strict accessibility compliance. Features an adaptive theme honoring `prefers-color-scheme` (dark and light modes) with high contrast ratios exceeding WCAG AAA standards (>= 7:1 for body copy), fluid keyboard navigation with visible focus rings (`:focus-visible`), an immediate keyboard skip-link (`Skip to main content`), semantic WAI-ARIA landmarks (`banner`, `main`, `region`, `status`), and dynamic `aria-live="polite"` status announcements for real-time telemetry updates. Respects `prefers-reduced-motion` by disabling CSS transitions and animations.
+- **Defense-in-Depth Security & Zero Secret Leakage:** The console runs under a strict `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. All operator credentials (`X-EdgeGate-Admin-Token`) are held exclusively in transient browser memory (JavaScript closure state), completely forbidding persistence in `localStorage`, `sessionStorage`, cookies, or browser history.
+- **Live Topology & Health Visualization:** Operators can inspect active cluster health, generation counts, circuit-breaker states across all pools, in-flight bulkheads, rate-limit consumption, and stream the cryptographic SHA-256 audit ledger with live client-side integrity validation.
+
+### Route-Level CORS Preflight & Browser/MCP Interoperability (`[routes.cors]`, `INV-27`)
+Modern AI agent workbenches and MCP developer frontends (e.g., browser-based LLM playgrounds, Keelway inspector UIs) frequently query EdgeGate endpoints from distinct origins:
+- **Declarative Route CORS Configuration:** Routes (`[[routes]]`) support optional `[routes.cors]`:
+  ```toml
+  [routes.cors]
+  allow_origins = ["https://console.internal", "https://agent.example.com"]
+  allow_methods = ["GET", "POST", "OPTIONS"]
+  allow_headers = ["Authorization", "Content-Type", "X-EdgeGate-Token", "X-MCP-Tool"]
+  expose_headers = ["X-EdgeGate-Timestamp", "X-EdgeGate-Signature-256"]
+  allow_credentials = true
+  max_age_s = 86400
+  ```
+- **Wildcard Rejection on Credentials:** Configuration validation forbids specifying wildcard origin `allow_origins = ["*"]` when `allow_credentials = true`, preventing credential exposure attacks.
+- **Zero-Secret Preflight Short-Circuiting:** Arriving `OPTIONS` requests matching a configured CORS route are evaluated at the routing layer before authentication, policy evaluation, or backend pool checkout. Preflight requests from authorized origins receive immediate `204 No Content` responses containing standard CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, `Access-Control-Max-Age: <seconds>`) and `Vary: Origin`, executing in microseconds without allocating upstream sockets or injecting credentials.
+- **Outbound Actual Request Headers:** On non-preflight requests, EdgeGate attaches matching CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials`, `Access-Control-Expose-Headers`, and `Vary: Origin`) to the downstream response.
+
+### W3C `tracestate` Distributed Tracing Interoperability (`src/router.rs`)
+While W3C `traceparent` (`INV-04`) provides core trace-id and span-id propagation, enterprise distributed tracing systems (OpenTelemetry, Jaeger, Datadog, AWS X-Ray) use the W3C `tracestate` header to propagate vendor-specific contextual state across service boundaries:
+- **W3C Trace Context Level 1 Validation:** In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), EdgeGate inspects incoming `tracestate` headers and strictly validates that:
+  1. The header value contains only printable ASCII characters (0x20 to 0x7E).
+  2. The total length does not exceed the W3C 512-byte limit.
+  3. The number of comma-separated `key=value` list members does not exceed 32.
+- **Upstream & Shadow Propagation:** Valid `tracestate` headers are forwarded intact to primary and shadow upstream backends alongside `traceparent`. If an incoming `tracestate` is malformed, oversized, or non-ASCII, it is stripped fail-closed to prevent header smuggling or log poisoning upstream.

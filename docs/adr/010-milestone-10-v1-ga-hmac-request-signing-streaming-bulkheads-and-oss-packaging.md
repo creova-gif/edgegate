@@ -27,20 +27,19 @@ Production deployment across distributed agent execution environments and high-s
 
 ## Decision
 
-### 1. Outbound Cryptographic Request Signing — HMAC-SHA256 (`INV-23`, [src/config.rs](src/config.rs), [src/router.rs](src/router.rs), [src/proxy.rs](src/proxy.rs), [src/telemetry.rs](src/telemetry.rs))
+### 1. Outbound Cryptographic Request Signing — HMAC-SHA256 (`INV-23`, [../../src/config.rs](../../src/config.rs), [../../src/router.rs](../../src/router.rs), [../../src/proxy.rs](../../src/proxy.rs), [../../src/telemetry.rs](../../src/telemetry.rs))
 - **Configuration Model:**
   Extend `RouteConfig` (`[[routes]]`) and `CompiledRoute` with `request_signing: Option<RequestSigningConfig>`:
   ```toml
   [routes.request_signing]
-  key_ref = "webhook_hmac_key"              # Resolves org-scoped secret in [[secrets]]
-  algorithm = "hmac_sha256"                 # Validated supported algorithm enum
-  header_name = "X-EdgeGate-Signature-256"  # Header receiving sha256=<hex_digest>
-  timestamp_header = "X-EdgeGate-Timestamp" # Header receiving Unix epoch seconds
+  credential_ref = "webhook_hmac_key"          # Resolves org-scoped secret in [[secrets]]
+  signature_header = "X-EdgeGate-Signature-256" # Header receiving sha256=<hex_digest>
+  timestamp_header = "X-EdgeGate-Timestamp"     # Header receiving Unix epoch seconds
   ```
 - **Forged Header Stripping:**
-  In `sanitize_outbound_headers` ([src/router.rs](src/router.rs)), unconditionally strip both `header_name` (`X-EdgeGate-Signature-256`) and `timestamp_header` (`X-EdgeGate-Timestamp`) from incoming requests prior to signing so callers cannot inject forged signatures or manipulate timestamp windows.
+  In `sanitize_outbound_headers` ([../../src/router.rs](../../src/router.rs)), unconditionally strip both `signature_header` (`X-EdgeGate-Signature-256`) and `timestamp_header` (`X-EdgeGate-Timestamp`) from incoming requests prior to signing so callers cannot inject forged signatures or manipulate timestamp windows.
 - **Canonical Payload & Signature Computation:**
-  - Retrieve the signing key using `SecretProvider::get_secret(&identity.org_id, &signing.key_ref)`. Verify that `expires_at_epoch_s` has not elapsed; if missing or expired, fail closed with `403 Forbidden`.
+  - Retrieve the signing key using `SecretProvider::get_secret(&identity.org_id, &signing.credential_ref)`. Verify that `expires_at_epoch_s` has not elapsed; if missing or expired, fail closed with `403 Forbidden`.
   - Capture current Unix epoch seconds `timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()`.
   - Canonicalize the signing input as `<timestamp>.<raw_body>` (using empty byte slice for empty bodies).
   - Compute RFC 2104 HMAC-SHA256 using `ring::hmac` or `hmac` + `sha2`. Format the resulting digest as `sha256=<lowercase_hex_string>`.
@@ -48,7 +47,7 @@ Production deployment across distributed agent execution environments and high-s
 - **Observability:**
   Increment atomic telemetry counter `signed_requests_total` (`edgegate_signed_requests_total` in Prometheus exposition format) upon every successful signature injection.
 
-### 2. Stream-Lifetime Workload Bulkhead & Graceful-Drain Guards (`INV-20` Hardening, [src/auth.rs](src/auth.rs), [src/proxy.rs](src/proxy.rs))
+### 2. Stream-Lifetime Workload Bulkhead & Graceful-Drain Guards (`INV-20` Hardening, [../../src/auth.rs](../../src/auth.rs), [../../src/proxy.rs](../../src/proxy.rs))
 - **Live-Reload Persistent Counters:**
   Workload concurrency is tracked via `Arc<AtomicUsize>` active counters keyed by `(org_id, workload_id)` in `WorkloadAuthenticator`. When `RuntimeSnapshot` is atomically swapped via `ArcSwap`, active counter instances for surviving workloads are preserved, preventing counter resets or permit leaks across configuration hot reloads.
 - **`GuardedResponseBody` Wrapper:**
@@ -62,13 +61,13 @@ Production deployment across distributed agent execution environments and high-s
   ```
   Both `WorkloadBulkheadGuard` (decrementing active workload count) and `InFlightGuard` (decrementing `in_flight_requests`) are retained inside `GuardedResponseBody` until `inner.poll_frame()` returns `Poll::Ready(None)` (clean stream EOF) or `GuardedResponseBody` is dropped (client disconnect, cancellation, or error). This ensures SSE, gRPC, and chunked streams remain accounted against concurrency quotas and server shutdown drains for their full operational lifetime.
 
-### 3. Trailer-Preserving Response Size Caps & Circuit-Breaker Fault Isolation (`INV-21` Hardening, [src/proxy.rs](src/proxy.rs), [src/lb.rs](src/lb.rs))
+### 3. Trailer-Preserving Response Size Caps & Circuit-Breaker Fault Isolation (`INV-21` Hardening, [../../src/proxy.rs](../../src/proxy.rs), [../../src/lb.rs](../../src/lb.rs))
 - **Trailer-Preserving Bounded Stream:**
   When `max_response_body_bytes` is configured, EdgeGate bounds response frames using `BufferedBodyWithTrailers` that accumulates frames up to the limit while capturing HTTP/2 trailers (e.g., `grpc-status`, `grpc-message`). Configured `strip_response_headers` are stripped from both initial response headers and trailing headers.
 - **Circuit-Breaker Fault Isolation:**
   When an upstream response violates `max_response_body_bytes` (`http_body_util::LengthLimitError`), EdgeGate aborts the transfer with `502 Bad Gateway` (`{"error":"upstream response exceeded maximum allowed body size"}`) and increments `upstream_errors_total`. However, EdgeGate explicitly bypasses `CircuitBreaker::record_failure` on `LengthLimitError`. A route-level payload overflow represents a payload policy boundary, not an upstream node crash, preventing false breaker trips from affecting sibling traffic.
 
-### 4. Strict JSON-RPC 2.0 Envelope Validation & Explicit Empty Allowlist (`INV-22` Hardening, [src/policy.rs](src/policy.rs), [src/config.rs](src/config.rs))
+### 4. Strict JSON-RPC 2.0 Envelope Validation & Explicit Empty Allowlist (`INV-22` Hardening, [../../src/policy.rs](../../src/policy.rs), [../../src/config.rs](../../src/config.rs))
 - **Option Representation:**
   Represent `allowed_jsonrpc_methods` in `PolicyRuleConfig` and `CompiledPolicyRule` as `Option<Vec<String>>`:
   - `None`: JSON-RPC inspection is disabled; arbitrary payloads are permitted.
@@ -76,7 +75,7 @@ Production deployment across distributed agent execution environments and high-s
 - **Strict Protocol Enforcement:**
   Both single JSON-RPC objects and items within batch arrays must carry `"jsonrpc": "2.0"`. Any object missing `"jsonrpc": "2.0"` or specifying another version is rejected fail-closed with `400 Bad Request` or `403 Forbidden`.
 
-### 5. CLI Cleartext Admin Credential Protection ([src/main.rs](src/main.rs))
+### 5. CLI Cleartext Admin Credential Protection ([../../src/main.rs](../../src/main.rs))
 - **Transport Security Enforcement in `edgegate audit`:**
   - If `--url` uses the `http://` scheme and targets a non-loopback host (not `127.0.0.1`, `localhost`, or `::1`), `edgegate audit` refuses execution with an explicit security error unless `--allow-insecure-http` is explicitly passed.
   - If `--ca-cert` is supplied with an `http://` URL, execution is rejected immediately as a contradictory configuration.
