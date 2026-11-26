@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose a new capability or enhancement for EdgeGate
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an enhancement to EdgeGate.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: A clear and concise description of the problem or limitation you are facing.
+      placeholder: "As a platform engineer deploying autonomous LLM agents, I need to..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed L7 Gateway Capability / Config Schema
+      description: Describe the proposed gateway capability, policy rule, routing mechanism, or configuration schema additions.
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: security_impact
+    attributes:
+      label: Security & Threat Model Impact
+      description: How does this capability interact with EdgeGate's zero-secret boundary, default-deny policy, SSRF defenses, and audit verification?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative designs, workarounds, or existing tools you considered.
+    validations:
+      required: false

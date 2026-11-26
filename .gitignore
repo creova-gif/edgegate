@@ -1,6 +1,23 @@
+# Rust build artifacts
 /target
-.agents/
+*.profraw
+lcov.info
+
+# Runtime sockets & local credentials
+*.sock
+*.pem.local
 .env
 .env.*
-.DS_Store
+
+# Agent & temporary scratch dirs
+.agents/
 .gstack/tmp/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE & Editor configurations
+.idea/
+.vscode/

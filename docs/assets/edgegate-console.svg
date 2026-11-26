@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 460" width="920" height="460">
+  <defs>
+    <style>
+      .bg { fill: #0d1117; }
+      .chrome { fill: #161b22; stroke: #30363d; stroke-width: 1; }
+      .chrome-title { fill: #8b949e; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+      .term-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 11.5px; }
+      .prompt { fill: #58a6ff; font-weight: 600; }
+      .cmd { fill: #c9d1d9; }
+      .banner { fill: #388bfd; font-weight: 600; }
+      .banner-dim { fill: #8b949e; }
+      .th { fill: #e3b341; font-weight: 600; }
+      .td-scen { fill: #c9d1d9; }
+      .td-ctrl { fill: #8b949e; }
+      .pass { fill: #3fb950; font-weight: 600; }
+      .block { fill: #f85149; font-weight: 600; }
+      .audit-head { fill: #d2a8ff; font-weight: 600; }
+      .audit-valid { fill: #3fb950; font-weight: 600; }
+      .audit-dim { fill: #8b949e; }
+      .telemetry { fill: #79c0ff; }
+      .cursor { fill: #58a6ff; }
+    </style>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="920" height="460" rx="8" class="bg"/>
+
+  <!-- Window Chrome Header -->
+  <rect x="0" y="0" width="920" height="38" rx="8" class="chrome"/>
+  <!-- Prevent bottom rounded corners on chrome header -->
+  <rect x="0" y="28" width="920" height="10" fill="#161b22"/>
+  <line x1="0" y1="38" x2="920" y2="38" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Window Controls -->
+  <circle cx="20" cy="19" r="6" fill="#ff5f56"/>
+  <circle cx="38" cy="19" r="6" fill="#ffbd2e"/>
+  <circle cx="56" cy="19" r="6" fill="#27c93f"/>
+
+  <!-- Window Title -->
+  <text x="460" y="23" text-anchor="middle" class="chrome-title">edgegate security_console_demo &amp; audit — v1.0.0 GA</text>
+
+  <!-- Terminal Output -->
+  <g class="term-text">
+    <!-- Command 1 -->
+    <text x="24" y="60">
+      <tspan class="prompt">edgegate-gw:~$</tspan>
+      <tspan class="cmd"> cargo run --example security_console_demo</tspan>
+    </text>
+
+    <!-- Console Header Banner -->
+    <text x="24" y="80" class="banner-dim">====================================================================================================</text>
+    <text x="24" y="98" class="banner">  EdgeGate Security Console — Zero-Secret Workload Egress &amp; Live Verification (v1.0.0 GA)</text>
+    <text x="24" y="116" class="banner-dim">====================================================================================================</text>
+
+    <!-- Table Header -->
+    <text x="24" y="136">
+      <tspan class="th">  Scenario</tspan>
+      <tspan class="banner-dim" dx="195">|</tspan>
+      <tspan class="th" dx="10">Security Control</tspan>
+      <tspan class="banner-dim" dx="132">|</tspan>
+      <tspan class="th" dx="10">Gateway Decision</tspan>
+    </text>
+    <text x="24" y="152" class="banner-dim">---------------------------------------------+------------------------------------+-------------------------</text>
+
+    <!-- Scenario 1: PASS 200 OK -->
+    <text x="24" y="172">
+      <tspan class="td-scen">  1. GitHub &amp; MCP tools/list</tspan>
+      <tspan class="banner-dim" x="290">|</tspan>
+      <tspan class="td-ctrl" x="306">Scoped Bearer + HMAC-SHA256 Injected</tspan>
+      <tspan class="banner-dim" x="556">|</tspan>
+      <tspan class="pass" x="572">ALLOWED (200 OK)</tspan>
+      <tspan class="pass" x="822">[PASS]</tspan>
+    </text>
+
+    <!-- Scenario 2: BLOCK 403 (Egress DLP & admin/shutdown) -->
+    <text x="24" y="192">
+      <tspan class="td-scen">  2. MCP admin/shutdown Call</tspan>
+      <tspan class="banner-dim" x="290">|</tspan>
+      <tspan class="td-ctrl" x="306">Egress DLP &amp; MCP Tool Allowlist</tspan>
+      <tspan class="banner-dim" x="556">|</tspan>
+      <tspan class="block" x="572">BLOCKED (403 Forbidden)</tspan>
+      <tspan class="pass" x="822">[PASS]</tspan>
+    </text>
+
+    <!-- Scenario 3: BLOCK 403 (SSRF 169.254.169.254 & Path Traversal) -->
+    <text x="24" y="212">
+      <tspan class="td-scen">  3. Metadata SSRF / Traversal</tspan>
+      <tspan class="banner-dim" x="290">|</tspan>
+      <tspan class="td-ctrl" x="306">169.254.169.254 &amp; Path Scrub Guard</tspan>
+      <tspan class="banner-dim" x="556">|</tspan>
+      <tspan class="block" x="572">BLOCKED (403 Forbidden)</tspan>
+      <tspan class="pass" x="822">[PASS]</tspan>
+    </text>
+
+    <!-- Scenario 4: BLOCK 502 (Compromised upstream secret reflection) -->
+    <text x="24" y="232">
+      <tspan class="td-scen">  4. Upstream Cred Reflection</tspan>
+      <tspan class="banner-dim" x="290">|</tspan>
+      <tspan class="td-ctrl" x="306">Egress Response Reflection Intercept</tspan>
+      <tspan class="banner-dim" x="556">|</tspan>
+      <tspan class="block" x="572">BLOCKED (502 Bad GW)</tspan>
+      <tspan class="pass" x="822">[PASS]</tspan>
+    </text>
+
+    <!-- Table Footer Divider -->
+    <text x="24" y="250" class="banner-dim">====================================================================================================</text>
+
+    <!-- Command 2 -->
+    <text x="24" y="278">
+      <tspan class="prompt">edgegate-gw:~$</tspan>
+      <tspan class="cmd"> edgegate audit --url https://127.0.0.1:8443 --ca-cert certs/ca.pem</tspan>
+    </text>
+
+    <!-- Audit Output -->
+    <text x="24" y="298">
+      <tspan class="audit-head">[Audit Ledger]</tspan>
+      <tspan class="cmd"> Fetching SHA-256 hash-chained records from /_edgegate/admin/audit...</tspan>
+    </text>
+
+    <text x="24" y="318">
+      <tspan class="audit-dim">[Genesis] 0000000000000000000000000000000000000000000000000000000000000000</tspan>
+    </text>
+
+    <text x="24" y="338">
+      <tspan class="audit-dim">[Head]    a82f3c1d9b04e672f1058c42d3e7190b246a81d4e5f7392c01b4a8e67f23c901 (seq=14,280)</tspan>
+    </text>
+
+    <text x="24" y="358">
+      <tspan class="audit-valid">✓ Cryptographic verification complete: </tspan>
+      <tspan class="cmd">14,280/14,280 entries verified | </tspan>
+      <tspan class="audit-valid">valid: true</tspan>
+    </text>
+
+    <!-- Telemetry & Performance Snapshot -->
+    <text x="24" y="382">
+      <tspan class="audit-head">[/_edgegate/metrics]</tspan>
+      <tspan class="telemetry"> throughput: 27,458 req/s | overhead: +0.91ms p95 | secret_reflections_blocked: 1</tspan>
+    </text>
+    <text x="24" y="400">
+      <tspan class="audit-head">[/_edgegate/pools]</tspan>
+      <tspan class="cmd">   upstreams=4 healthy=4 circuit_state=Closed active_conns=32 idle_conns=128</tspan>
+    </text>
+
+    <!-- Terminal Prompt Return -->
+    <text x="24" y="428">
+      <tspan class="prompt">edgegate-gw:~$</tspan>
+      <tspan class="cursor"> █</tspan>
+    </text>
+  </g>
+</svg>

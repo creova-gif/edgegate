@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,8 +38,6 @@ use crate::EdgeGateError;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
-type WorkloadBulkheadMap = HashMap<(String, String), (usize, Arc<tokio::sync::Semaphore>)>;
-
 /// Optional routing-key header for `ConsistentHash` load balancing (`Milestone 3`).
 pub const ROUTING_KEY_HEADER: &str = "x-edgegate-routing-key";
 
@@ -68,20 +67,93 @@ impl Drop for BoxletSandboxGuard {
     }
 }
 
-struct InFlightGuard<'a> {
-    telemetry: &'a Telemetry,
+pub struct WorkloadBulkheadGuard {
+    active: Arc<AtomicUsize>,
 }
 
-impl<'a> InFlightGuard<'a> {
-    fn new(telemetry: &'a Telemetry) -> Self {
+impl Drop for WorkloadBulkheadGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct InFlightGuard {
+    telemetry: Arc<Telemetry>,
+}
+
+impl InFlightGuard {
+    fn new(telemetry: Arc<Telemetry>) -> Self {
         telemetry.inc_in_flight();
         Self { telemetry }
     }
 }
 
-impl Drop for InFlightGuard<'_> {
+impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.telemetry.dec_in_flight();
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct GuardedResponseBody {
+        #[pin]
+        inner: ProxyBody,
+        _in_flight: Option<InFlightGuard>,
+        _bulkhead: Option<WorkloadBulkheadGuard>,
+    }
+}
+
+impl hyper::body::Body for GuardedResponseBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let res = this.inner.poll_frame(cx);
+        match &res {
+            std::task::Poll::Ready(None) | std::task::Poll::Ready(Some(Err(_))) => {
+                *this._in_flight = None;
+                *this._bulkhead = None;
+            }
+            _ => {}
+        }
+        res
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+struct BufferedBodyWithTrailers {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl hyper::body::Body for BufferedBodyWithTrailers {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(bytes) = self.data.take() {
+            if !bytes.is_empty() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))));
+            }
+        }
+        if let Some(trailers) = self.trailers.take() {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+        }
+        std::task::Poll::Ready(None)
     }
 }
 
@@ -126,7 +198,7 @@ impl RuntimeSnapshot {
 pub struct EdgeGateProxy {
     runtime: Arc<ArcSwap<RuntimeSnapshot>>,
     telemetry: Arc<Telemetry>,
-    bulkheads: Mutex<WorkloadBulkheadMap>,
+    bulkheads: Mutex<HashMap<(String, String), Arc<AtomicUsize>>>,
 }
 
 impl EdgeGateProxy {
@@ -392,7 +464,7 @@ impl EdgeGateProxy {
         req: Request<Incoming>,
         transport_auth: Option<&dyn WorkloadAuthenticator>,
     ) -> Response<ProxyBody> {
-        let _in_flight_guard = InFlightGuard::new(&self.telemetry);
+        let mut in_flight_guard = Some(InFlightGuard::new(Arc::clone(&self.telemetry)));
         let started = Instant::now();
         let path = req.uri().path();
 
@@ -592,24 +664,27 @@ impl EdgeGateProxy {
         };
 
         // Step 2b: Per-workload concurrency quota / bulkhead isolation (INV-20).
-        let _workload_bulkhead_permit = if let Some(limit) = identity.max_concurrent_requests {
-            let sem = {
+        let mut bulkhead_guard = if let Some(limit) = identity.max_concurrent_requests {
+            let counter = {
                 let mut guard = match self.bulkheads.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 let key = (identity.org_id.clone(), identity.workload_id.clone());
-                match guard.get(&key) {
-                    Some((existing_limit, sem)) if *existing_limit == limit => Arc::clone(sem),
-                    _ => {
-                        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
-                        guard.insert(key, (limit, Arc::clone(&sem)));
-                        sem
-                    }
-                }
+                guard
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                    .clone()
             };
-            match sem.try_acquire_owned() {
-                Ok(permit) => Some(permit),
+            #[allow(deprecated)]
+            match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                if cur < limit {
+                    Some(cur + 1)
+                } else {
+                    None
+                }
+            }) {
+                Ok(_) => Some(WorkloadBulkheadGuard { active: counter }),
                 Err(_) => {
                     self.telemetry.record_bulkhead_rejected();
                     self.telemetry.record_replay(ReplayRecord {
@@ -788,18 +863,21 @@ impl EdgeGateProxy {
         }
 
         // Step 4c: JSON-RPC 2.0 / MCP Tool-Call Method Allowlist Guard (`Milestone 9`) BEFORE upstream selection.
-        if !allowed_jsonrpc_methods.is_empty() {
+        if let Some(ref allowed_methods) = allowed_jsonrpc_methods {
             let is_allowed = match serde_json::from_slice::<serde_json::Value>(&collected) {
-                Ok(serde_json::Value::Object(map)) => map
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|m| allowed_jsonrpc_methods.iter().any(|allowed| allowed == m)),
+                Ok(serde_json::Value::Object(map)) => {
+                    map.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+                        && map.get("method").and_then(|v| v.as_str()).is_some_and(|m| {
+                            !m.is_empty() && allowed_methods.iter().any(|am| am == m)
+                        })
+                }
                 Ok(serde_json::Value::Array(items)) if !items.is_empty() => {
                     items.iter().all(|item| {
                         if let serde_json::Value::Object(map) = item {
-                            map.get("method").and_then(|v| v.as_str()).is_some_and(|m| {
-                                allowed_jsonrpc_methods.iter().any(|allowed| allowed == m)
-                            })
+                            map.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+                                && map.get("method").and_then(|v| v.as_str()).is_some_and(|m| {
+                                    !m.is_empty() && allowed_methods.iter().any(|am| am == m)
+                                })
                         } else {
                             false
                         }
@@ -944,6 +1022,46 @@ impl EdgeGateProxy {
             }
         }
 
+        if let Some(ref signing) = route.request_signing {
+            outbound_headers.remove(&signing.signature_header);
+            outbound_headers.remove(&signing.timestamp_header);
+            let secret = match snap
+                .secrets
+                .get_secret(&identity.org_id, &signing.credential_ref)
+            {
+                Ok(s) => s,
+                Err(err) => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        &backend_id,
+                        "BLOCKED",
+                        err,
+                        started,
+                    );
+                }
+            };
+            let unix_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let ts_prefix = format!("{unix_s}.");
+            let signing_input = [ts_prefix.as_bytes(), collected.as_ref()].concat();
+            let sig_hex =
+                crate::config::hmac_sha256_hex(secret.expose().as_bytes(), &signing_input);
+            let sig_val = format!("sha256={sig_hex}");
+            if let Ok(ts_val) = HeaderValue::from_str(&unix_s.to_string()) {
+                outbound_headers.insert(signing.timestamp_header.clone(), ts_val);
+            }
+            if let Ok(sig_val_header) = HeaderValue::from_str(&sig_val) {
+                outbound_headers.insert(signing.signature_header.clone(), sig_val_header);
+            }
+            self.telemetry.record_signed_request();
+        }
+
         let upstream_pq = rewrite_upstream_path_and_query(&path, query.as_deref(), &route);
         let upstream_uri = match Uri::builder().path_and_query(upstream_pq.as_str()).build() {
             Ok(u) => u,
@@ -1065,49 +1183,92 @@ impl EdgeGateProxy {
                     }
                 }
 
-                let mapped = if route.max_response_body_bytes.is_some()
-                    || reflection_guard_secret.is_some()
-                {
+                let is_buffered =
+                    route.max_response_body_bytes.is_some() || reflection_guard_secret.is_some();
+                let mapped = if is_buffered {
                     let (parts, incoming_body) = resp.into_parts();
-                    let body_bytes = if let Some(limit) = route.max_response_body_bytes {
+                    let (body_bytes, trailers) = if let Some(limit) = route.max_response_body_bytes
+                    {
                         match Limited::new(incoming_body, limit).collect().await {
-                            Ok(c) => c.to_bytes(),
-                            Err(_) => {
+                            Ok(collected_body) => {
+                                let trailers = collected_body.trailers().cloned();
+                                let body_bytes = collected_body.to_bytes();
+                                (body_bytes, trailers)
+                            }
+                            Err(box_err) => {
                                 let latency_us = started.elapsed().as_micros() as u64;
-                                snap.lb.record_failure(&pool_name, &backend_id);
-                                self.telemetry.record_replay(ReplayRecord {
-                                    request_id: req_id,
-                                    trace_id: trace_id.clone(),
-                                    org_id: identity.org_id.clone(),
-                                    workload_id: identity.workload_id.clone(),
-                                    method: method.as_str().to_string(),
-                                    path: path.clone(),
-                                    route: route.id.clone(),
-                                    upstream: backend_id.clone(),
-                                    status: StatusCode::BAD_GATEWAY.as_u16(),
-                                    shadow_status: None,
-                                    reason: "max_response_body_bytes_exceeded".to_string(),
-                                    latency_us,
-                                });
-                                return self.finish_error(
-                                    req_id,
-                                    &trace_id,
-                                    &identity.org_id,
-                                    &identity.workload_id,
-                                    &route.id,
-                                    &backend_id,
-                                    "ERROR",
-                                    EdgeGateError::BadGateway(
-                                        "upstream response body exceeds max_response_body_bytes"
-                                            .to_string(),
-                                    ),
-                                    started,
-                                );
+                                let is_limit_exceeded = box_err
+                                    .downcast_ref::<http_body_util::LengthLimitError>()
+                                    .is_some();
+                                if is_limit_exceeded {
+                                    snap.lb.record_success(&pool_name, &backend_id, latency_us);
+                                    self.telemetry.record_replay(ReplayRecord {
+                                        request_id: req_id,
+                                        trace_id: trace_id.clone(),
+                                        org_id: identity.org_id.clone(),
+                                        workload_id: identity.workload_id.clone(),
+                                        method: method.as_str().to_string(),
+                                        path: path.clone(),
+                                        route: route.id.clone(),
+                                        upstream: backend_id.clone(),
+                                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                                        shadow_status: None,
+                                        reason: "response_body_too_large".to_string(),
+                                        latency_us,
+                                    });
+                                    return self.finish_error(
+                                        req_id,
+                                        &trace_id,
+                                        &identity.org_id,
+                                        &identity.workload_id,
+                                        &route.id,
+                                        &backend_id,
+                                        "ERROR",
+                                        EdgeGateError::BadGateway(
+                                            "upstream response body exceeds max_response_body_bytes"
+                                                .to_string(),
+                                        ),
+                                        started,
+                                    );
+                                } else {
+                                    snap.lb.record_failure(&pool_name, &backend_id);
+                                    self.telemetry.record_replay(ReplayRecord {
+                                        request_id: req_id,
+                                        trace_id: trace_id.clone(),
+                                        org_id: identity.org_id.clone(),
+                                        workload_id: identity.workload_id.clone(),
+                                        method: method.as_str().to_string(),
+                                        path: path.clone(),
+                                        route: route.id.clone(),
+                                        upstream: backend_id.clone(),
+                                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                                        shadow_status: None,
+                                        reason: "upstream_transport_or_timeout".to_string(),
+                                        latency_us,
+                                    });
+                                    return self.finish_error(
+                                        req_id,
+                                        &trace_id,
+                                        &identity.org_id,
+                                        &identity.workload_id,
+                                        &route.id,
+                                        &backend_id,
+                                        "ERROR",
+                                        EdgeGateError::BadGateway(format!(
+                                            "failed to read upstream response body: {box_err}"
+                                        )),
+                                        started,
+                                    );
+                                }
                             }
                         }
                     } else {
                         match incoming_body.collect().await {
-                            Ok(c) => c.to_bytes(),
+                            Ok(collected_body) => {
+                                let trailers = collected_body.trailers().cloned();
+                                let body_bytes = collected_body.to_bytes();
+                                (body_bytes, trailers)
+                            }
                             Err(err) => {
                                 let latency_us = started.elapsed().as_micros() as u64;
                                 snap.lb.record_failure(&pool_name, &backend_id);
@@ -1181,9 +1342,11 @@ impl EdgeGateProxy {
                     }
                     Response::from_parts(
                         parts,
-                        Full::new(body_bytes)
-                            .map_err(|never| match never {})
-                            .boxed(),
+                        BufferedBodyWithTrailers {
+                            data: Some(body_bytes),
+                            trailers,
+                        }
+                        .boxed(),
                     )
                 } else {
                     resp.map(|b| b.boxed())
@@ -1263,6 +1426,16 @@ impl EdgeGateProxy {
                         }
                         frame
                     })
+                    .boxed()
+                } else {
+                    body
+                };
+                let body = if !is_buffered {
+                    GuardedResponseBody {
+                        inner: body,
+                        _in_flight: in_flight_guard.take(),
+                        _bulkhead: bulkhead_guard.take(),
+                    }
                     .boxed()
                 } else {
                     body

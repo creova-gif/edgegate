@@ -71,6 +71,9 @@ enum Command {
         /// Optional custom CA certificate PEM file for HTTPS verification.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+        /// Allow sending admin token over cleartext HTTP to non-loopback hosts.
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
 }
 
@@ -95,6 +98,9 @@ async fn fetch_endpoint_with_header(
         .map_err(|e| format!("invalid URL '{full_url}': {e}"))?;
 
     let scheme = uri.scheme_str().unwrap_or("http");
+    if ca_cert.is_some() && scheme != "https" {
+        return Err("--ca-cert requires an https:// URL".to_string());
+    }
     let is_https = match scheme {
         "http" => false,
         "https" => true,
@@ -246,7 +252,25 @@ async fn main() -> ExitCode {
             url,
             admin_token,
             ca_cert,
+            allow_insecure_http,
         } => {
+            let uri: Uri = match url.parse() {
+                Ok(u) => u,
+                Err(e) => {
+                    error!(error = %e, "invalid audit URL");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let scheme = uri.scheme_str().unwrap_or("http");
+            let host = uri.host().unwrap_or("");
+            let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+            if (scheme == "http" || uri.scheme().is_none()) && !allow_insecure_http && !is_loopback
+            {
+                error!(
+                    "refusing to send admin token over cleartext http:// to non-loopback host (use https:// or pass --allow-insecure-http)"
+                );
+                return ExitCode::FAILURE;
+            }
             let resolved_token = admin_token.or_else(|| std::env::var("EDGEGATE_ADMIN_TOKEN").ok());
             let token = match resolved_token {
                 Some(t) if !t.trim().is_empty() => t,
