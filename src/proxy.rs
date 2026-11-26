@@ -50,6 +50,23 @@ impl Drop for BoxletSandboxGuard {
     }
 }
 
+struct InFlightGuard<'a> {
+    telemetry: &'a Telemetry,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(telemetry: &'a Telemetry) -> Self {
+        telemetry.inc_in_flight();
+        Self { telemetry }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.telemetry.dec_in_flight();
+    }
+}
+
 /// Immutable runtime snapshot stored behind `ArcSwap` for lock-free hot-path reads
 /// and atomic zero-downtime config reloads.
 pub struct RuntimeSnapshot {
@@ -276,22 +293,47 @@ impl EdgeGateProxy {
                         }
                     };
                     let _ = stream.set_nodelay(true);
-                    let io = TokioIo::new(stream);
+                    let inbound_tls = self.runtime.load().config.inbound_tls.clone();
                     let proxy = Arc::clone(&self);
                     tokio::spawn(async move {
                         let service = service_fn(move |req: Request<Incoming>| {
                             let proxy = Arc::clone(&proxy);
                             async move { Ok::<_, std::convert::Infallible>(proxy.handle_request(req).await) }
                         });
-                        if let Err(err) = AutoConnBuilder::new(TokioExecutor::new())
-                            .serve_connection(io, service)
-                            .await
-                        {
-                            error!(error = %err, "edgegate_connection_error");
+                        if let Some(tls_cfg) = inbound_tls {
+                            let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+                            let tls_stream = match acceptor.accept(stream).await {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    error!(error = %err, "edgegate_inbound_tls_accept_error");
+                                    return;
+                                }
+                            };
+                            let io = TokioIo::new(tls_stream);
+                            if let Err(err) = AutoConnBuilder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                error!(error = %err, "edgegate_connection_error");
+                            }
+                        } else {
+                            let io = TokioIo::new(stream);
+                            if let Err(err) = AutoConnBuilder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                error!(error = %err, "edgegate_connection_error");
+                            }
                         }
                     });
                 }
             }
+        }
+
+        let drain_timeout = self.runtime.load().config.drain_timeout;
+        let drain_deadline = Instant::now() + drain_timeout;
+        while self.telemetry.in_flight_count() > 0 && Instant::now() < drain_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(())
     }
@@ -316,6 +358,7 @@ impl EdgeGateProxy {
         req: Request<Incoming>,
         transport_auth: Option<&dyn WorkloadAuthenticator>,
     ) -> Response<ProxyBody> {
+        let _in_flight_guard = InFlightGuard::new(&self.telemetry);
         let started = Instant::now();
         let path = req.uri().path();
 
@@ -539,6 +582,7 @@ impl EdgeGateProxy {
             outbound_headers.insert(HeaderName::from_static(TRACEPARENT_HEADER), tp_val);
         }
 
+        let mut reflection_guard_secret = None;
         if let Some(ref binding) = route.credential {
             let secret = match snap
                 .secrets
@@ -577,6 +621,9 @@ impl EdgeGateProxy {
                 }
             };
             outbound_headers.insert(binding.header_name.clone(), header_val);
+            if binding.block_secret_reflection && !secret.expose().is_empty() {
+                reflection_guard_secret = Some(secret);
+            }
         }
 
         let max_body = snap.config.max_request_body_bytes;
@@ -617,33 +664,184 @@ impl EdgeGateProxy {
             }
         };
 
-        let mut outbound_req = match Request::builder()
-            .method(method.clone())
-            .uri(upstream_uri.clone())
-            .body(Full::new(collected.clone()))
-        {
-            Ok(r) => r,
-            Err(err) => {
-                return self.finish_error(
-                    req_id,
-                    &trace_id,
-                    &identity.org_id,
-                    &identity.workload_id,
-                    &route.id,
-                    &backend_id,
-                    "ERROR",
-                    EdgeGateError::Internal(format!("failed to build upstream request: {err}")),
-                    started,
-                );
+        // Step 7: Forward through bounded pool (NO 3xx auto-follow; controlled retries only for idempotent methods).
+        let max_retries = if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            snap.config
+                .pools
+                .get(&route.pool)
+                .map_or(0, |p| p.max_idempotent_retries)
+        } else {
+            0
+        };
+
+        let mut backend_id = backend_id;
+        let mut attempt = 0u32;
+        let send_res = loop {
+            let mut outbound_req = match Request::builder()
+                .method(method.clone())
+                .uri(upstream_uri.clone())
+                .body(Full::new(collected.clone()))
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    return self.finish_error(
+                        req_id,
+                        &trace_id,
+                        &identity.org_id,
+                        &identity.workload_id,
+                        &route.id,
+                        &backend_id,
+                        "ERROR",
+                        EdgeGateError::Internal(format!("failed to build upstream request: {err}")),
+                        started,
+                    );
+                }
+            };
+            *outbound_req.headers_mut() = outbound_headers.clone();
+
+            lease.settle_probe();
+            match snap.pool.send(lease, outbound_req).await {
+                Ok(resp) => break Ok(resp),
+                Err(EdgeGateError::BadGateway(msg)) if attempt < max_retries => {
+                    snap.lb.record_failure(&pool_name, &backend_id);
+                    self.telemetry.record_retry();
+                    let Ok(next_lease) = snap.lb.select_with_key(&route.pool, Some(effective_key))
+                    else {
+                        break Err(EdgeGateError::BadGateway(msg));
+                    };
+                    attempt += 1;
+                    backend_id = next_lease.backend.id.clone();
+                    if let Ok(host_val) = HeaderValue::from_str(&next_lease.backend.authority) {
+                        outbound_headers.insert(HOST, host_val);
+                    }
+                    lease = next_lease;
+                }
+                Err(err) => break Err(err),
             }
         };
-        *outbound_req.headers_mut() = outbound_headers.clone();
 
-        // Step 7: Forward through bounded pool (NO 3xx auto-follow, NO auto-retry).
-        lease.settle_probe();
-        match snap.pool.send(lease, outbound_req).await {
+        match send_res {
             Ok(resp) => {
-                let status = resp.status();
+                // Step 7a: Response Credential Reflection Guard (`Milestone 5`).
+                let mapped = if let Some(ref secret) = reflection_guard_secret {
+                    let needle = secret.expose().as_bytes();
+                    let header_reflected = resp.headers().values().any(|v| {
+                        v.as_bytes()
+                            .windows(needle.len())
+                            .any(|window| window == needle)
+                    });
+                    if header_reflected {
+                        let latency_us = started.elapsed().as_micros() as u64;
+                        self.telemetry.record_secret_reflection_blocked();
+                        self.telemetry.record_replay(ReplayRecord {
+                            request_id: req_id,
+                            trace_id: trace_id.clone(),
+                            org_id: identity.org_id.clone(),
+                            workload_id: identity.workload_id.clone(),
+                            method: method.as_str().to_string(),
+                            path: path.clone(),
+                            route: route.id.clone(),
+                            upstream: backend_id.clone(),
+                            status: StatusCode::BAD_GATEWAY.as_u16(),
+                            shadow_status: None,
+                            reason: "credential_reflection_blocked".to_string(),
+                            latency_us,
+                        });
+                        return self.finish_error(
+                            req_id,
+                            &trace_id,
+                            &identity.org_id,
+                            &identity.workload_id,
+                            &route.id,
+                            &backend_id,
+                            "ERROR",
+                            EdgeGateError::BadGateway(
+                                "upstream credential reflection blocked".to_string(),
+                            ),
+                            started,
+                        );
+                    }
+
+                    let (parts, incoming_body) = resp.into_parts();
+                    let body_bytes = match incoming_body.collect().await {
+                        Ok(c) => c.to_bytes(),
+                        Err(err) => {
+                            let latency_us = started.elapsed().as_micros() as u64;
+                            snap.lb.record_failure(&pool_name, &backend_id);
+                            self.telemetry.record_replay(ReplayRecord {
+                                request_id: req_id,
+                                trace_id: trace_id.clone(),
+                                org_id: identity.org_id.clone(),
+                                workload_id: identity.workload_id.clone(),
+                                method: method.as_str().to_string(),
+                                path: path.clone(),
+                                route: route.id.clone(),
+                                upstream: backend_id.clone(),
+                                status: StatusCode::BAD_GATEWAY.as_u16(),
+                                shadow_status: None,
+                                reason: "upstream_transport_or_timeout".to_string(),
+                                latency_us,
+                            });
+                            return self.finish_error(
+                                req_id,
+                                &trace_id,
+                                &identity.org_id,
+                                &identity.workload_id,
+                                &route.id,
+                                &backend_id,
+                                "ERROR",
+                                EdgeGateError::BadGateway(format!(
+                                    "failed to read upstream response body: {err}"
+                                )),
+                                started,
+                            );
+                        }
+                    };
+                    let body_reflected = body_bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle);
+                    if body_reflected {
+                        let latency_us = started.elapsed().as_micros() as u64;
+                        self.telemetry.record_secret_reflection_blocked();
+                        self.telemetry.record_replay(ReplayRecord {
+                            request_id: req_id,
+                            trace_id: trace_id.clone(),
+                            org_id: identity.org_id.clone(),
+                            workload_id: identity.workload_id.clone(),
+                            method: method.as_str().to_string(),
+                            path: path.clone(),
+                            route: route.id.clone(),
+                            upstream: backend_id.clone(),
+                            status: StatusCode::BAD_GATEWAY.as_u16(),
+                            shadow_status: None,
+                            reason: "credential_reflection_blocked".to_string(),
+                            latency_us,
+                        });
+                        return self.finish_error(
+                            req_id,
+                            &trace_id,
+                            &identity.org_id,
+                            &identity.workload_id,
+                            &route.id,
+                            &backend_id,
+                            "ERROR",
+                            EdgeGateError::BadGateway(
+                                "upstream credential reflection blocked".to_string(),
+                            ),
+                            started,
+                        );
+                    }
+                    Response::from_parts(
+                        parts,
+                        Full::new(body_bytes)
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                } else {
+                    resp.map(|b| b.boxed())
+                };
+
+                let status = mapped.status();
                 let latency_us = started.elapsed().as_micros() as u64;
                 if status.is_server_error() {
                     snap.lb.record_failure(&pool_name, &backend_id);
@@ -695,7 +893,7 @@ impl EdgeGateProxy {
                     status.as_u16(),
                     latency_us,
                 );
-                let mut mapped = resp.map(|b| b.boxed());
+                let mut mapped = mapped;
                 if let Ok(trace_val) = HeaderValue::from_str(&trace_id) {
                     mapped
                         .headers_mut()
